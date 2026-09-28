@@ -14,6 +14,7 @@ import os
 import socket
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -30,6 +31,7 @@ os.environ["SSHMCP_OUTPUT"] = str(_TMP / "output")
 os.environ["SSHMCP_POLICY"] = str(HERE / "policy.json")
 
 import ssh_mcp as M  # noqa: E402
+import ssh_policy as P  # noqa: E402
 
 REAL_IP = "10.81.2.100"
 WRONG_FP = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -311,6 +313,60 @@ class ExecWiring(unittest.TestCase):
             res = M.execute("100", "make -j8")
         self.assertFalse(res["allowed"])
         self.assertEqual(res["reason"], "output_unwritable")
+
+
+class GrantUnlock(unittest.TestCase):
+    """root + rw_allowed 的解锁路径。
+
+    100 验不到这段：它是「非 root + rw_allowed → 长期 rw」，而 resolve_mode 在
+    base.mode == \"rw\" 时直接 return，压根不读 grant（ssh_mcp.py:204）。
+    所以真机上签的条子对 100 是空转，只有 root 账号才会消费它。
+    """
+
+    CRED = {"address": REAL_IP, "username": "root", "auth": "password", "password": "x", "hostKey": WRONG_FP, "rw_allowed": True}
+
+    def setUp(self):
+        write_hosts({"admin": dict(self.CRED)})
+        M.save_grants(M.GrantFile(grants=[]))
+
+    def _issue(self, **kw) -> None:
+        kw.setdefault("id", "g-test")
+        kw.setdefault("expires_at", (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat())
+        M.save_grants(M.GrantFile(grants=[M.P.Grant(alias="admin", **kw)]))
+
+    def test_root_without_grant_stays_ro(self):
+        cred = M.HOSTS.get()["admin"]
+        info = M.resolve_mode("admin", "touch /tmp/a", cred)
+        self.assertEqual(info.mode, "ro")
+        self.assertIsNone(info.grant)
+
+    def test_host_grant_unlocks_root(self):
+        self._issue(scope="host")
+        info = M.resolve_mode("admin", "touch /tmp/a", M.HOSTS.get()["admin"])
+        self.assertEqual(info.mode, "rw")
+        self.assertEqual(info.grant.id, "g-test")
+
+    def test_expired_grant_does_not_unlock(self):
+        self._issue(scope="host", expires_at=(datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat())
+        self.assertEqual(M.resolve_mode("admin", "touch /tmp/a", M.HOSTS.get()["admin"]).mode, "ro")
+
+    def test_execute_consumes_cmd_grant(self):
+        """cmd scope 才计数；host scope 靠 TTL，用完不减 —— 这条把消费链跑通。"""
+        self._issue(scope="cmd", command="touch /tmp/mcp-grant-probe", uses_left=1)
+
+        def ok_run(cred, command, cwd, idle_s, max_s, spill):
+            spill.write("out", b"created\n")
+            spill.close()
+            return M.RunResult(
+                exit_code=0, stdout=spill.inline("out"), stderr="", truncated=False,
+                timed_out=None, output_id=spill.run_id, stats=spill.stats(),
+            )
+
+        with mock.patch.object(M, "run_command", ok_run):
+            res = M.execute("admin", "touch /tmp/mcp-grant-probe")
+        self.assertTrue(res["allowed"])
+        self.assertEqual(res["decision"]["grant_id"], "g-test", "审计与返回都得带上是谁批的")
+        self.assertEqual(M.grants_for("admin"), [], "cmd grant 用一次就该没了")
 
 
 if __name__ == "__main__":

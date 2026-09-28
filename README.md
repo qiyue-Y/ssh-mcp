@@ -66,6 +66,8 @@ uv run --quiet test_connect_refusals.py
 
 `privileged` 由 `username == "root"` 推导，不可手工覆盖。`sudo` 在 rw 黑名单里，MCP 这条路上不会自动提权。
 
+**grant 只对 root 账号有意义。** `resolve_mode` 在长期 rw 时直接返回（ssh_mcp.py:204），不会去读 grant —— 所以给「非 root + `rw_allowed: true`」的主机（比如 100）签条子是**空转**：命令照样放行，但审计里 `grant_id=null`、`uses_left` 也不减。真要验解锁路径只能靠 root 账号主机，`test_connect_refusals.py` 的 `GrantUnlock` 用假 `run_command` 覆盖了这条（含 cmd scope 的消费计数）。另外 cmd scope 才计次数，host scope 只靠 TTL 到期。
+
 ## 黑名单怎么比（Agent 必读）
 
 判定发生在**发给远端 shell 之前**，所以「看着不像但等价」的写法必须自己归一，否则规则形同虚设。当前做四件事：
