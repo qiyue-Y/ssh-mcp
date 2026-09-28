@@ -30,8 +30,16 @@ def _end_at_newline(data: bytes) -> bytes:
 
 
 def _start_at_newline(data: bytes) -> bytes:
+    """把窗口对齐到行首：丢掉开头那半行。
+
+    若整窗恰好就是「一条以换行收尾的行」（真机出现过 14 字节的尾巴
+    `MCP_TAIL_MARK\\n`），此时 find 到的换行就是最后一个字节，按原写法会把
+    整窗当半行丢光 —— 那种情况整窗保留。
+    """
     cut = data.find(b"\n")
-    return data[cut + 1 :] if cut >= 0 else data
+    if cut < 0 or cut == len(data) - 1:
+        return data
+    return data[cut + 1 :]
 
 
 class _Band:
@@ -67,6 +75,10 @@ class _Band:
             self._push_tail(blob[self.head_budget :])
 
     def _push_tail(self, chunk: bytes) -> None:
+        if not chunk:
+            # 空 chunk 不带任何数据，却会让 popleft 的"至少留一个"保护失效：
+            # 真实尾部被全部驱逐，只剩这个空元素，内联就变成"有头无尾"
+            return
         self._tail.append(chunk)
         self._tail_len += len(chunk)
         #  deque 只需兜住「够切出预算内最后一个整行」，2 倍预算足够，且内存有界

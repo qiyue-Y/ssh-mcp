@@ -61,6 +61,41 @@ class InlineBand(unittest.TestCase):
                 continue
             self.fail(f"出现非整行碎片：{row!r}")
 
+    def test_live_chunk_sequence_keeps_the_tail(self):
+        """按真机实测序列回归：[32768, 32768, 32768, 10590, 14]。
+
+        最后那 14 字节就是 `MCP_TAIL_MARK\\n`：驱逐后窗口只剩这一条完整行，
+        而「对齐到行首」把窗内第一个换行之前全丢掉 —— 那个换行正好是最后一个字节，
+        于是整窗被当半行丢光，内联变成有头无尾。逐行小口喂的用例照不出这个形状。
+        """
+        spill = make(head=4096, tail=4096)
+        blob = b"".join(f"{n}\n".encode() for n in range(1, 20001)) + b"MCP_TAIL_MARK\n"
+        assert len(blob) == 108908, len(blob)
+        pos = 0
+        for size in (32768, 32768, 32768, 10590, 14):
+            spill.write("out", blob[pos : pos + size])
+            pos += size
+        spill.close()
+        text = spill.inline("out")
+        self.assertTrue(spill.clipped)
+        self.assertIn("MCP_TAIL_MARK", text, "尾部整窗被对齐逻辑吃掉了")
+        self.assertLess(len(text.encode()), 4096 + 4096 + 200)
+
+    def test_empty_chunk_does_not_evict_the_tail(self):
+        """真机复现：recv_ready() 与 recv() 之间撞上 EOF 会喂进一个 b""，
+        而驱逐条件是 len(deque)>1 —— 空元素让真实尾部数据被全部踢掉，内联只剩头部。"""
+        spill = make(head=4096, tail=4096)
+        blob = b"".join(f"row-{n:06d}\n".encode() for n in range(1, 20001))
+        spill.write("out", blob[:65536])
+        spill.write("out", b"")  # 空 chunk：不该动任何东西
+        spill.write("out", blob[65536:])
+        spill.write("out", b"")
+        spill.close()
+        text = spill.inline("out")
+        self.assertTrue(spill.clipped)
+        self.assertIn("row-000001", text)
+        self.assertIn("row-020000", text, "尾部被空 chunk 挤掉了")
+
     def test_marker_does_not_introduce_a_blank_line(self):
         spill = make(head=256, tail=256)
         feed_lines(spill, 800)
