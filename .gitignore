@@ -1,0 +1,12 @@
+# 凭据与运行时产物，一律不入库
+ssh_mcp_hosts.json
+grants.json
+audit/
+*.tmp
+.selftest_*
+
+# Python
+__pycache__/
+*.py[cod]
+.uv/
+.venv/
