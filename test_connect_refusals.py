@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,6 +26,7 @@ _AUDIT = _TMP / "audit.jsonl"
 os.environ["SSHMCP_HOSTS"] = str(_HOSTS)
 os.environ["SSHMCP_AUDIT"] = str(_AUDIT)
 os.environ["SSHMCP_GRANTS"] = str(_TMP / "grants.json")
+os.environ["SSHMCP_OUTPUT"] = str(_TMP / "output")
 os.environ["SSHMCP_POLICY"] = str(HERE / "policy.json")
 
 import ssh_mcp as M  # noqa: E402
@@ -36,6 +38,14 @@ WRONG_FP = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 def write_hosts(entries: dict) -> None:
     _HOSTS.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
     M.HOSTS._mtime = None
+
+
+def _port_open(ip: str, port: int = 22, timeout: float = 3.0) -> bool:
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 class Refusals(unittest.TestCase):
@@ -75,6 +85,8 @@ class Refusals(unittest.TestCase):
 
     def test_wrong_hostkey_blocks_before_auth(self):
         """指纹不符必须在认证之前就把连接掐掉，且不去试密码。"""
+        if not _port_open(REAL_IP):
+            self.skipTest(f"{REAL_IP}:22 不可达 —— 这条要真握手才能拿到对方主机密钥，离开校园网跑不了")
         write_hosts(
             {
                 "100": {
@@ -232,6 +244,73 @@ class ModeTable(unittest.TestCase):
         write_hosts({"100": {**self.CRED, "username": "user", "rw_allowed": True}})
         info = M.resolve_mode("100", "touch /tmp/a", M.HOSTS.get()["100"])
         self.assertEqual(info.mode, "rw")
+
+
+class ExecWiring(unittest.TestCase):
+    """execute → 全文落盘 → read_output → 审计 的接线。
+
+    run_command 被换掉，所以这条不需要网络也能覆盖到「大输出会不会被完整捞回」这一段
+    —— 真机可达性另说，别把这条测试当成远端验证。
+    """
+
+    CRED = {"address": REAL_IP, "username": "user", "auth": "password", "password": "x", "hostKey": WRONG_FP, "rw_allowed": True}
+
+    @staticmethod
+    def _fake_run(cred, command, cwd, idle_s, max_s, spill):
+        for n in range(1, 5001):
+            spill.write("out", f"row {n:05d} compiling\n".encode())
+        spill.write("err", b"make: *** [Makefile:12: all] Error 2\n")
+        spill.close()
+        return M.RunResult(
+            exit_code=2,
+            stdout=spill.inline("out"),
+            stderr=spill.inline("err"),
+            truncated=spill.clipped,
+            timed_out=None,
+            output_id=spill.run_id,
+            stats=spill.stats(),
+        )
+
+    def test_big_output_is_clipped_inline_but_reachable_by_reference(self):
+        write_hosts({"100": dict(self.CRED)})
+        with mock.patch.object(M, "run_command", self._fake_run):
+            res = M.execute("100", "make -j8")
+        self.assertTrue(res["allowed"])
+        self.assertEqual(res["exit_code"], 2)
+        self.assertTrue(res["truncated"])
+        self.assertIn("省略", res["stdout"], "内联该是头尾两截")
+        self.assertLess(len(res["stdout"].encode()), 12000, "内联不该把 80KB 全灌回 Agent")
+        self.assertIn("Error 2", res["stderr"], "报错就在尾部，绝不能被丢掉")
+
+        oid = res["output_id"]
+        self.assertTrue((M.OUTPUT_ROOT / f"{oid}.out.log").is_file())
+        found = M._tool_read_output(oid, "out", "grep", pattern="row 04321")
+        self.assertEqual(found["matched"], 1)
+        self.assertTrue(found["text"].startswith("4321: "), found["text"][:40])
+        tail = M._tool_read_output(oid, "out", "tail", limit=4096)
+        self.assertIn("row 05000 compiling", tail["text"])
+
+    def test_audit_carries_the_output_reference(self):
+        write_hosts({"100": dict(self.CRED)})
+        with mock.patch.object(M, "run_command", self._fake_run):
+            res = M.execute("100", "make -j8")
+        hit = [r for r in M.audit_tail(None, 30) if r.get("output_id") == res["output_id"]]
+        self.assertEqual(len(hit), 1, "审计必须能顺 output_id 走到全文")
+        self.assertEqual(hit[0]["exit_code"], 2)
+        self.assertEqual(hit[0]["output"]["out"]["lines"], 5000)
+
+    def test_bad_output_id_is_a_payload_not_an_exception(self):
+        bad = M._tool_read_output("../../etc/passwd", "out", "tail")
+        self.assertFalse(bad["found"])
+        self.assertIn("run_id", bad["error"])
+
+    def test_unwritable_output_dir_fails_closed(self):
+        """写不了全文日志就不执行：与审计同为必备件，不许静默降级成「只有内存里那份」。"""
+        write_hosts({"100": dict(self.CRED)})
+        with mock.patch.object(M, "OUTPUT_ROOT", Path("Z:\\nope\\output")):
+            res = M.execute("100", "make -j8")
+        self.assertFalse(res["allowed"])
+        self.assertEqual(res["reason"], "output_unwritable")
 
 
 if __name__ == "__main__":

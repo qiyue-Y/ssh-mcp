@@ -2,6 +2,7 @@
 ssh_mcp_hosts.json
 grants.json
 audit/
+output/
 *.tmp
 .selftest_*
 .qoder-credits/

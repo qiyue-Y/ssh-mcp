@@ -27,6 +27,12 @@ uv run --quiet E:\Ilovestudy\MyWork\mcp\ssh-mcp\ssh_mcp.py doctor
 python test_ssh_policy.py
 ```
 
+全文日志与回捞的离线用例（同样裸 python，不碰网络）：
+
+```powershell
+python test_output_store.py
+```
+
 连接拒绝与授权路径的用例要真导入 paramiko，必须用 `uv run`，且**不能写成 `uv run python xxx.py`** —— 那种写法不读文件头的 PEP 723 deps，会拿到本机 site-packages 里缺 `cryptography` 的 paramiko 而报 ModuleNotFoundError：
 
 ```powershell
@@ -75,8 +81,21 @@ uv run --quiet test_connect_refusals.py
 - `exec(host, command, cwd?, idle_timeout?, max_duration?)` —— 离散命令。被拒不建立连接，返回 `reason` + 下一步建议。
 - `session_reset(host)` —— 丢连接与 cwd 重来。
 - `audit_tail(host?, limit?)` —— 回看最近审计（含被拒）。
+- `read_output(output_id, stream?, mode?, start?, end?, pattern?, limit?)` —— 按 `exec` 返回的 `output_id` 回捞全文。`mode`：`head`/`tail` 按行边界取，`grep` 返回**带行号**的命中，`lines` 取 `[start,end]` 行；单次上限 16KB。
 
 **没有** 交互 shell / PTY / 按键透传，这是故意的：netcatty 那套长会话死在 `terminal_execute` 全部挂起上。
+
+**输出默认只回头尾两截。** `exec` 内联是 stdout 头 4KB + 省略标记 + 尾 4KB（stderr 是 1KB/2KB），全文写进本机 `output/<output_id>.{out,err}.log`；`truncated: true` 时返回值里带 `read_full` 提示怎么用 `read_output`。留尾部是重点 —— `make`/`pip`/`apt` 的失败原因就在最后几行，早先「留头弃尾」会把报错整块丢掉。
+
+## 全文日志与轮转
+
+落**本机**不落远端：ro 主机上把输出写到远端文件本身就是越权写，rw 主机也没必要堆别人的调试垃圾。
+
+- 单文件上限取 `policy.defaults.max_output_bytes`（现 8MB），超出即停止写入并在 `output.<stream>.overflow` 里标记
+- 轮转预算：`7 天` 且 `≤200 个 run` 且 `≤500MB`，任一命中就删整组；每次 `exec` 前顺手清一次（无定时器、无后台线程）
+- 以上预算可用环境变量覆盖：`SSHMCP_OUTPUT`（目录）、`SSHMCP_OUTPUT_KEEP_RUNS`、`SSHMCP_OUTPUT_KEEP_BYTES`、`SSHMCP_OUTPUT_KEEP_DAYS`
+- **全文是原文落盘，不做脱敏。** 构建日志里可能出现 `--password=`、`Authorization:`、带 token 的镜像源 URL。`output/` 已进 `.gitignore`，但如果你在本机跑了文件同步/分享工具，别让它覆盖这个目录 —— 这是这套设计换来的代价，换掉的收益是「Agent 能拿到结论而不用吞 80KB 日志」。
+- 日志目录写不了就 **fail-closed 拒绝执行**（与审计同级），不会静默降级成「只有内存里那份」。
 
 ## CLI（人在终端敲）
 
@@ -95,6 +114,7 @@ uv run --quiet ssh_mcp.py revoke 100 --all
 - `idle_timeout_s`（默认 30）：**无新输出**才触发。下载有进度条会不断重置，不会被误杀。
 - `max_duration_s`（默认 300）：硬兜底。
 - 超时只关 channel 不关连接，后续命令照常。
+- 超时被打断时，**已经收到的输出仍在 `output/` 里**，可以 `read_output` 捞回来看跑到哪一步了。
 - 静默长任务（编译、`tail -f`）M1 只能撞 max_duration；`detach` + `job_log` 在 M2。
 
 ## 已知边界

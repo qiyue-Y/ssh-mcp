@@ -2,7 +2,7 @@
   "defaults": {
     "idle_timeout_s": 30,
     "max_duration_s": 300,
-    "max_output_bytes": 204800,
+    "max_output_bytes": 8388608,
     "grant_ttl_default": "30m"
   },
 

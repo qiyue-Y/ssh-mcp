@@ -16,6 +16,23 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 
+# list_hosts 该露的是「这台怎么配」，不是密钥本身。
+# 注意别用 blob 里搜字符串的写法判泄露：auth 的值就是 "password"（认证方式名），会假红。
+SECRET_FIELDS = {"password", "passphrase", "token", "secret", "private_key", "key_path"}
+
+
+def find_secret_fields(node, path="") -> list[str]:
+    bad: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if str(key).lower() in SECRET_FIELDS:
+                bad.append(f"{path}.{key}")
+            bad += find_secret_fields(value, f"{path}.{key}")
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            bad += find_secret_fields(value, f"{path}[{index}]")
+    return bad
+
 
 def send(proc, msg: dict) -> None:
     proc.stdin.write((json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8"))
@@ -77,7 +94,7 @@ def main() -> int:
         tools = read_until(proc, 2).get("result", {}).get("tools", [])
         names = sorted(t["name"] for t in tools)
         print(f"tools/list  {time.monotonic() - t1:.2f}s  -> {names}")
-        for expect in ("audit_tail", "exec", "list_hosts", "session_reset"):
+        for expect in ("audit_tail", "exec", "list_hosts", "read_output", "session_reset"):
             if expect not in names:
                 failures.append(f"缺工具 {expect}")
 
@@ -91,9 +108,9 @@ def main() -> int:
         else:
             hosts = payload.get("hosts", [])
             print(f"list_hosts -> {len(hosts)} 台，allowlist {len(payload.get('ro_allowlist', []))} 条")
-            blob = json.dumps(payload, ensure_ascii=False)
-            if "password" in blob.lower():
-                failures.append("list_hosts 输出里出现了 password 字段")
+            leaked = find_secret_fields(payload)
+            if leaked:
+                failures.append(f"list_hosts 输出了密钥字段：{', '.join(leaked)}")
             for h in hosts:
                 print(f"   {h['alias']:<8} mode={h.get('effective_mode'):<12} {h.get('mode_reason', '')}")
     finally:

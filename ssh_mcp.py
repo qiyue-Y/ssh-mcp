@@ -40,6 +40,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import ssh_policy as P  # noqa: E402
+import output_store as OS  # noqa: E402
 
 
 def _path_from_env(var: str, default: Path) -> Path:
@@ -52,7 +53,15 @@ POLICY_PATH = _path_from_env("SSHMCP_POLICY", HOME_DIR / "policy.json")
 HOSTS_PATH = _path_from_env("SSHMCP_HOSTS", HOME_DIR / "ssh_mcp_hosts.json")
 GRANTS_PATH = _path_from_env("SSHMCP_GRANTS", HOME_DIR / "grants.json")
 AUDIT_PATH = _path_from_env("SSHMCP_AUDIT", HOME_DIR / "audit" / "ssh-mcp.jsonl")
+OUTPUT_ROOT = _path_from_env("SSHMCP_OUTPUT", HOME_DIR / "output")
 CONFIRM_TIMEOUT = int(os.environ.get("SSHMCP_CONFIRM_TIMEOUT", "120"))
+
+# 回给 Agent 的内联预算（字节）。全文在 output/ 里，想看随时 read_output 捞。
+INLINE_OUT = (4096, 4096)
+INLINE_ERR = (1024, 2048)
+OUTPUT_KEEP_RUNS = int(os.environ.get("SSHMCP_OUTPUT_KEEP_RUNS", "200"))
+OUTPUT_KEEP_BYTES = int(os.environ.get("SSHMCP_OUTPUT_KEEP_BYTES", str(500 * 1024 * 1024)))
+OUTPUT_KEEP_DAYS = int(os.environ.get("SSHMCP_OUTPUT_KEEP_DAYS", "7"))
 
 
 def log(msg: str) -> None:
@@ -404,38 +413,27 @@ class RunResult:
     stderr: str
     truncated: bool
     timed_out: str | None
+    output_id: str | None = None
+    stats: dict | None = None
 
 
-def _drain(chan, idle_s: float, deadline: float, cap: int) -> RunResult:
-    """按双计时器收流：idle 靠 recv 超时（有新输出就重置），max 靠 deadline。"""
-    out: list[bytes] = []
-    err: list[bytes] = []
-    out_len = err_len = 0
-    truncated = False
+def _drain(chan, idle_s: float, deadline: float, spill: OS.Spill) -> RunResult:
+    """按双计时器收流：idle 靠 recv 超时（有新输出就重置），max 靠 deadline。
+
+    每个 chunk 先全量落盘，内存里只留头尾两截，所以再大的输出也不会把服务撑爆，
+    也不会像早先那样「留头弃尾」把 make 的报错行整块丢掉。
+    """
     timed_out: str | None = None
+    why = "unknown"
 
     def take(chunk: bytes, is_err: bool) -> None:
-        nonlocal out_len, err_len, truncated
-        buf = err if is_err else out
-        have = err_len if is_err else out_len
-        room = cap - have
-        if room <= 0:
-            truncated = True
-            return
-        if len(chunk) > room:
-            buf.append(chunk[:room])
-            truncated = True
-        else:
-            buf.append(chunk)
-        if is_err:
-            err_len += len(chunk)
-        else:
-            out_len += len(chunk)
+        spill.write("err" if is_err else "out", chunk)
 
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             timed_out = "duration"
+            why = "duration"
             break
         chan.settimeout(min(idle_s, remaining))
         try:
@@ -445,16 +443,22 @@ def _drain(chan, idle_s: float, deadline: float, cap: int) -> RunResult:
             if chan.recv_stderr_ready():
                 take(chan.recv_stderr(65536), True)
                 continue
-            if chan.exit_status_ready():
+            if chan.exit_status_ready() and chan.eof_received:
+                # 只看 exit_status_ready 会提前收工：远端可以先报退出状态、数据还在路上，
+                # 此时 close 通道就把尾巴丢了，而 exit_code 依旧报 0（实测丢过 670KB）
+                why = "exit_and_eof"
                 break
             chunk = chan.recv(65536)  # 无数据时阻塞，超时抛 socket.timeout —— 即 idle
         except socket.timeout:
             timed_out = "idle"
+            why = "idle"
             break
         except (socket.error, OSError) as exc:
-            err.append(f"\n[ssh-mcp] 通道异常：{type(exc).__name__}: {exc}".encode())
+            take(f"\n[ssh-mcp] 通道异常：{type(exc).__name__}: {exc}".encode(), True)
+            why = f"channel_error:{type(exc).__name__}"
             break
         if not chunk:
+            why = "eof"
             break
         take(chunk, False)
 
@@ -470,6 +474,13 @@ def _drain(chan, idle_s: float, deadline: float, cap: int) -> RunResult:
             break
         else:
             time.sleep(0.02)
+    if timed_out or why not in ("exit_and_eof", "eof"):
+        # 正常收流不打日志（stderr 会被 MCP 客户端原样带出去），只在真的不对时吭一声
+        log(
+            f"drain 退出 原因={why} 已收 out={spill.written['out']}B err={spill.written['err']}B "
+            f"eof={getattr(chan, 'eof_received', '?')} closed={getattr(chan, 'closed', '?')} "
+            f"exit_ready={chan.exit_status_ready()}"
+        )
     try:
         code = chan.recv_exit_status() if chan.exit_status_ready() else -1
     except Exception:  # noqa: BLE001
@@ -478,19 +489,22 @@ def _drain(chan, idle_s: float, deadline: float, cap: int) -> RunResult:
         chan.close()
     except Exception:  # noqa: BLE001
         pass
+    spill.close()
     return RunResult(
         exit_code=code,
-        stdout=b"".join(out).decode("utf-8", "replace"),
-        stderr=b"".join(err).decode("utf-8", "replace"),
-        truncated=truncated,
+        stdout=spill.inline("out"),
+        stderr=spill.inline("err"),
+        truncated=spill.clipped,
         timed_out=timed_out,
+        output_id=spill.run_id,
+        stats=spill.stats(),
     )
 
 
 NO_RETRY = ("AuthenticationException", "HostKeyMismatch", "BadAuthenticationType", "PasswordRequiredException")
 
 
-def run_command(cred: HostCred, command: str, cwd: str, idle_s: float, max_s: float, cap: int) -> RunResult:
+def run_command(cred: HostCred, command: str, cwd: str, idle_s: float, max_s: float, spill: OS.Spill) -> RunResult:
     """在远端执行一条命令。cwd 由服务端记录，发送前才拼上，不参与策略判定。"""
     sent = command if cwd in ("", "~") else f"cd {shlex.quote(cwd)} && {command}"
     last_exc: Exception | None = None
@@ -502,7 +516,7 @@ def run_command(cred: HostCred, command: str, cwd: str, idle_s: float, max_s: fl
                 raise RuntimeError("transport 不可用")
             chan = transport.open_session()
             chan.exec_command(sent)
-            return _drain(chan, idle_s, time.monotonic() + max_s, cap)
+            return _drain(chan, idle_s, time.monotonic() + max_s, spill)
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             # 认证与指纹类错误重试只会喂 fail2ban，直接停
@@ -511,15 +525,19 @@ def run_command(cred: HostCred, command: str, cwd: str, idle_s: float, max_s: fl
                 break
             POOL.close(cred.alias)
             if attempt == 0:
+                spill.reset()  # 上一次可能已经写进去半截，不清掉日志会出现重复内容
                 continue
             break
     assert last_exc is not None
+    spill.close()
     return RunResult(
         exit_code=-1,
         stdout="",
         stderr=f"{type(last_exc).__name__}: {last_exc}",
         truncated=False,
         timed_out="connect_failed",
+        output_id=spill.run_id,
+        stats=spill.stats(),
     )
 
 
@@ -572,18 +590,26 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
     except OSError as exc:
         return _refuse(alias, command, "audit_write_failed", "audit_unwritable", f"审计目录不可写：{exc}", mode_info.mode)
 
-    cap = policy.max_output_bytes
     idle_s = float(idle_timeout or policy.idle_timeout_s)
     max_s = min(float(max_duration or policy.max_duration_s), policy.max_duration_s)
     start_cwd = cwd or POOL.cwd(alias)
 
+    # 全文落盘和审计同级：写不了就不执行，别把输出留在只有内存知道的地方
+    try:
+        spill = OS.Spill(OUTPUT_ROOT, uuid.uuid4().hex, policy.max_output_bytes, {"out": INLINE_OUT, "err": INLINE_ERR})
+    except OSError as exc:
+        return _refuse(alias, command, "output_unwritable", "output_unwritable", f"output 目录不可写：{exc}（全文日志与审计同为必备件）", mode_info.mode)
+    removed = OS.prune(OUTPUT_ROOT, OUTPUT_KEEP_RUNS, OUTPUT_KEEP_BYTES, OUTPUT_KEEP_DAYS)
+    if removed:
+        log(f"output/ 轮转清理了 {removed} 个 run")
+
     if cd_target is not None:
-        res = run_command(cred, f"cd {shlex.quote(cd_target)} && pwd", start_cwd, idle_s, max_s, cap)
+        res = run_command(cred, f"cd {shlex.quote(cd_target)} && pwd", start_cwd, idle_s, max_s, spill)
         end_cwd = res.stdout.strip().splitlines()[-1] if res.exit_code == 0 and res.stdout.strip() else start_cwd
         if res.exit_code == 0:
             POOL.set_cwd(alias, end_cwd)
     else:
-        res = run_command(cred, command, start_cwd, idle_s, max_s, cap)
+        res = run_command(cred, command, start_cwd, idle_s, max_s, spill)
         end_cwd = start_cwd
 
     broad = mode_info.grant is not None and P.broad_grant_hit(decision.segments, policy)
@@ -598,6 +624,8 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
             "matched_rule": decision.matched_rule,
             "mode": mode_info.mode,
             "exit_code": res.exit_code,
+            "output_id": res.output_id,
+            "output": res.stats,
             "grant_id": mode_info.grant.id if mode_info.grant else None,
             "broad_grant": broad or None,
             "stage": "result",
@@ -659,6 +687,14 @@ def _ok(alias, command, res: RunResult, cwd_before, cwd_after, mode_info: ModeIn
     }
     if res.timed_out == "duration":
         payload["hint"] = "撞到 max_duration：静默长任务应改用 detach（M2 提供）"
+    if res.output_id:
+        payload["output_id"] = res.output_id
+        payload["output"] = res.stats
+        if res.truncated:
+            payload["read_full"] = (
+                f"内联已按行边界省略，全文在本地日志：read_output(output_id={res.output_id}, "
+                "mode='grep', pattern='error') 拿行号，再用 mode='lines', start, end 取上下文"
+            )
     return payload
 
 
@@ -719,7 +755,9 @@ def _tool_list_hosts() -> dict:
                 "limits": {
                     "idle_timeout_s": policy.idle_timeout_s,
                     "max_duration_s": policy.max_duration_s,
-                    "max_output_bytes": policy.max_output_bytes,
+                    "max_output_file_bytes": policy.max_output_bytes,
+                    "inline_output": f"stdout 头 {INLINE_OUT[0]}B + 尾 {INLINE_OUT[1]}B（stderr {INLINE_ERR[0]}/{INLINE_ERR[1]}），全文用 read_output(output_id) 回捞",
+                    "output_retention": f"{OUTPUT_KEEP_DAYS} 天 / ≤{OUTPUT_KEEP_RUNS} run / ≤{OUTPUT_KEEP_BYTES // 1048576}MB",
                 },
             }
         )
@@ -744,6 +782,21 @@ def _tool_session_reset(host: str) -> dict:
 
 def _tool_audit_tail(host: str | None = None, limit: int = 50) -> dict:
     return {"records": audit_tail(host, min(max(1, limit), 500))}
+
+
+def _tool_read_output(
+    output_id: str,
+    stream: str = "out",
+    mode: str = "tail",
+    start: int = 1,
+    end: int = 0,
+    pattern: str = "",
+    limit: int = 16384,
+) -> dict:
+    try:
+        return OS.read_output(OUTPUT_ROOT, output_id, stream, mode, start, end, pattern, min(max(512, limit), 65536))
+    except ValueError as exc:
+        return {"found": False, "error": str(exc)}
 
 
 def _import_highlevel_server():
@@ -796,6 +849,25 @@ def build_server():
     async def _audit_tail(host: str | None = None, limit: int = 50) -> dict:
         return _tool_audit_tail(host, limit)
 
+    @server.tool(
+        name="read_output",
+        description=(
+            "按 exec 返回的 output_id 回捞该命令的完整本机日志（exec 内联只给头尾两截）。"
+            "mode：head/tail 按行边界取，grep 返回带行号的命中，lines 取 [start,end] 行。"
+            "典型用法：grep 'error' 拿到行号，再用 lines(start=行号-20, end=行号+40) 看上下文。"
+        ),
+    )
+    async def _read_output(
+        output_id: str,
+        stream: str = "out",
+        mode: str = "tail",
+        start: int = 1,
+        end: int = 0,
+        pattern: str = "",
+        limit: int = 16384,
+    ) -> dict:
+        return _tool_read_output(output_id, stream, mode, start, end, pattern, limit)
+
     return server
 
 
@@ -837,6 +909,22 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         print("\n审计目录可写 ✓")
     except OSError as exc:
         print(f"\n审计目录不可写：{exc}（服务会 fail-closed 拒绝执行）")
+        return 1
+    try:
+        OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+        probe = OUTPUT_ROOT / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        logs = list(OUTPUT_ROOT.glob("*.log"))
+        runs = len({f.name.split(".")[0] for f in logs})
+        used = sum(f.stat().st_size for f in logs)
+        print(
+            f"全文日志目录可写 ✓ {OUTPUT_ROOT}\n"
+            f"  现存 {runs} 个 run / {used / 1048576:.1f} MB；轮转预算：{OUTPUT_KEEP_DAYS} 天内、"
+            f"≤{OUTPUT_KEEP_RUNS} 个 run、≤{OUTPUT_KEEP_BYTES // 1048576} MB，单文件上限取自 policy.max_output_bytes"
+        )
+    except OSError as exc:
+        print(f"\noutput 目录不可写：{exc}（全文日志与审计同为必备件，会 fail-closed 拒绝执行）")
         return 1
     for mod in ("paramiko", "mcp"):
         try:
