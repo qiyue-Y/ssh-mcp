@@ -4,6 +4,7 @@ grants.json
 audit/
 *.tmp
 .selftest_*
+.qoder-credits/
 
 # Python
 __pycache__/

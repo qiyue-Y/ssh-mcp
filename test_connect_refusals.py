@@ -14,6 +14,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 
@@ -186,10 +187,31 @@ class KeyLoading(unittest.TestCase):
         self.assertIsNotNone(M._load_private_key(cred))
 
     def test_missing_key_gives_actionable_error(self):
-        cred = M.HostCred(alias="probe", address="x", username="u", auth="key", key_path="Z:\\nope\\id_x")
-        with self.assertRaises(RuntimeError) as ctx:
-            M._load_private_key(cred)
+        # agent 里有 key 的机器上不该走报错分支，这里把 agent 钉成空的，保证跨机器稳定
+        with mock.patch("paramiko.agent.Agent") as agent_cls:
+            agent_cls.return_value.get_keys.return_value = []
+            cred = M.HostCred(alias="probe", address="x", username="u", auth="key", key_path="Z:\\nope\\id_x")
+            with self.assertRaises(RuntimeError) as ctx:
+                M._load_private_key(cred)
         self.assertIn("key_path", str(ctx.exception))
+
+    def test_agent_fallback_when_file_key_unusable(self):
+        """带 passphrase 的文件私钥解不开时改问 ssh-agent，并取它给的第一把 key。"""
+        garbage = _TMP / "passphrase_key"
+        garbage.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n不是真私钥\n", encoding="utf-8")
+        sentinel = object()
+        with mock.patch("paramiko.agent.Agent") as agent_cls:
+            agent_cls.return_value.get_keys.return_value = [sentinel]
+            key = M._load_private_key(M.HostCred(alias="probe", address="x", username="u", auth="key", key_path=str(garbage)))
+        self.assertIs(key, sentinel)
+
+    def test_agent_absent_is_reported_not_swallowed(self):
+        """Windows 上 ssh-agent 默认 Stopped/Disabled，paramiko 会直接抛 —— 不能静默当成认证失败。"""
+        cred = M.HostCred(alias="probe", address="x", username="u", auth="key", key_path="Z:\\nope\\id_x")
+        with mock.patch("paramiko.agent.Agent", side_effect=OSError("no agent pipe")):
+            with self.assertRaises(RuntimeError) as ctx:
+                M._load_private_key(cred)
+        self.assertIn("ssh-agent", str(ctx.exception))
 
 
 class ModeTable(unittest.TestCase):

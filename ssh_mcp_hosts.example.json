@@ -1,0 +1,44 @@
+{
+  "_说明": "复制成 ssh_mcp_hosts.json 后填真实凭据。本示例文件可以入库，真实凭据文件已被 .gitignore 挡住。",
+
+  "example-rw": {
+    "address": "10.0.0.10",
+    "port": 22,
+    "username": "deploy",
+    "auth": "password",
+    "password": "<填口令>",
+    "hostKey": "SHA256:<服务器指纹>",
+    "rw_allowed": true,
+    "purpose": "非特权 + rw_allowed -> 长期可写（黑名单仍生效）"
+  },
+
+  "example-ro": {
+    "address": "10.0.0.11",
+    "port": 22,
+    "username": "ops",
+    "auth": "password",
+    "password": "<填口令>",
+    "hostKey": "SHA256:<服务器指纹>",
+    "purpose": "不写 rw_allowed 就永远只读，grant 也解不开"
+  },
+
+  "example-root-needs-grant": {
+    "address": "10.0.0.12",
+    "port": 22,
+    "username": "root",
+    "auth": "password",
+    "password": "<填口令>",
+    "hostKey": "SHA256:<服务器指纹>",
+    "rw_allowed": true,
+    "purpose": "root 账号默认只读，写操作需人工 grant（弹窗确认）"
+  },
+
+  "example-key": {
+    "address": "10.0.0.13",
+    "port": 22,
+    "username": "ci",
+    "auth": "key",
+    "hostKey": "SHA256:<服务器指纹>",
+    "purpose": "私钥认证。key_path 可省略，缺省按 ~/.ssh/{id_ed25519,id_rsa,id_ecdsa,id_dsa} 顺序找。注意：带 passphrase 的私钥目前不支持，请先转成无口令或走 ssh-agent"
+  }
+}

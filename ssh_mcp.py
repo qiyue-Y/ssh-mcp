@@ -274,6 +274,21 @@ def _build_pinned_policy(expected: str):
     return _Pinned()
 
 
+def _from_ssh_agent():
+    """把私钥交给 ssh-agent 签名：带 passphrase 的私钥不必进服务进程内存。
+
+    只取 agent 里的第一把 key。逐把试认证会连着打远端的失败次数，
+    NO_RETRY 那条教训（认证类错误重试只会喂 fail2ban）说的就是这个。
+    """
+    try:
+        from paramiko.agent import Agent
+
+        keys = Agent().get_keys()
+    except Exception:  # noqa: BLE001 - agent 服务没起时 paramiko 直接抛，按"没有可用 key"处理
+        return None
+    return keys[0] if keys else None
+
+
 def _load_private_key(cred: HostCred):
     import paramiko
 
@@ -295,8 +310,13 @@ def _load_private_key(cred: HostCred):
                 return loader.from_private_key_file(str(path))
             except Exception:  # noqa: BLE001 - 类型不匹配是正常尝试路径
                 continue
-        raise RuntimeError(f"私钥 {path} 无法解析（可能带 passphrase，请交给 ssh-agent）")
-    raise RuntimeError("找不到可用私钥，请在凭据里填 key_path 或把 key 加入 ssh-agent")
+    key = _from_ssh_agent()
+    if key is not None:
+        return key
+    raise RuntimeError(
+        "找不到可用私钥：候选文件都解不开（带 passphrase 的文件私钥不支持），ssh-agent 里也没有 key。"
+        "请让 key_path 指向无口令私钥，或把私钥 ssh-add 进 agent"
+    )
 
 
 class Pool:

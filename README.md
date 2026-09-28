@@ -2,7 +2,7 @@
 
 常驻 SSH 会话的 MCP 服务。替代 `E:\Ilovestudy\env\passkey\ssh-key.ps1`（那个继续保留，两者并存）。
 
-设计规格见工作区的 `ssh-mcp-SPEC.md`。
+设计取舍都写在本文件的「权限模型速查」和「已知边界」两节里。早期那份 `ssh-mcp-SPEC.md` 不在本仓库内，条目编号（§5.1、§8、§11）仍沿用它，读到编号时以本文件为准。
 
 ## 它解决什么
 
@@ -21,7 +21,7 @@
 uv run --quiet E:\Ilovestudy\MyWork\mcp\ssh-mcp\ssh_mcp.py doctor
 ```
 
-离线策略测试（裸 python 即可，不需要 paramiko）：
+离线策略测试（裸 python 即可，不需要 paramiko；36 例，覆盖 ro/rw 判定与黑名单绕过向量）：
 
 ```powershell
 python test_ssh_policy.py
@@ -36,6 +36,8 @@ uv run --quiet test_connect_refusals.py
 ## 配
 
 1. `copy ssh_mcp_hosts.example.json ssh_mcp_hosts.json`，填真实凭据。**这个文件我不读不写**，`hostKey` 缺失会直接拒连。
+   可用字段：`address` `port` `username` `auth`（`password`/`key`）`password` `key_path` `hostKey` `rw_allowed` `purpose`。
+   `auth: "key"` 时 `key_path` 可省略，缺省按 `~/.ssh/{id_ed25519,id_rsa,id_ecdsa,id_dsa}` 顺序找。**带 passphrase 的文件私钥不支持**，此时改为问 ssh-agent 并取它的第一把 key（只取一把：逐把试认证会连着打远端的失败次数）。Windows 的 `ssh-agent` 服务默认是 Stopped/Disabled，要先 `Set-Service ssh-agent -StartupType Manual` 起服务再 `ssh-add`。
 2. `policy.json` 的 `hosts` 键集合 = 可连白名单。凭据里有但这里没列的主机连不上（两处都要点头）。
 3. Qoder 里加 MCP（或手工写进 MCP 配置）：
 
@@ -57,6 +59,15 @@ uv run --quiet test_connect_refusals.py
 | `root` | 永远 ro | 默认 ro，需未过期 grant |
 
 `privileged` 由 `username == "root"` 推导，不可手工覆盖。`sudo` 在 rw 黑名单里，MCP 这条路上不会自动提权。
+
+## 黑名单怎么比（Agent 必读）
+
+判定发生在**发给远端 shell 之前**，所以「看着不像但等价」的写法必须自己归一，否则规则形同虚设。当前做四件事：
+
+- **路径归一**：`//etc`、`/etc/`、`/./`、`/*` 都折叠回规范形态，所以 `rm -rf /*` 命中 `rm -rf /` 那条。远端 shell 的 `*` 展平发生在放行之后，指望不上。
+- **权限位等价**：数字 token 按整数值比，`chmod 0777 /` 等于 `chmod 777 /`。
+- **引号外的 `;` `|` `&` 补空格再切**：`df -h;rm -rf /var` 是两条命令，早期版本会把 `;` 粘进前一个 token、只看见 `df` 就放行 —— ro 模式也会因此失守。`2>&1` / `&>` 里的 `&` 不算分隔符。
+- **包装器剥壳**：`nohup`/`env`/`nice`/`time`/`timeout`/`stdbuf`/`unshare`/`setarch`/`watch`/`strace`/`xargs`/`busybox` 这类前缀词后面逐个复检；`sh`/`bash`/`dash`/`ksh`/`zsh` 的 `-c` 字符串整条重跑判定。**只在剥完仍被黑名单拦住时才收紧**，所以 `nice -n 10 make -j8`、`env FOO=bar python app.py` 照常放行。
 
 ## 工具
 
@@ -93,3 +104,5 @@ uv run --quiet ssh_mcp.py revoke 100 --all
 3. cmd grant 对包管理器类命令（`apt`/`pip`/`npm`/`docker`/`systemctl`）≈放行任意执行，这类命中会打 `broad_grant` 标记，只标注不改行为。
 4. 引号内的 `>` `<` 已通过掩码排除；但 `grep a>b`（未加引号）仍会被判为重定向 —— 宁可错杀。
 5. 密码解密后常驻服务进程内存。长期方案是全量转私钥认证。
+6. **静态分析有地板**：`$(echo rm) -rf /`、`R=/; rm -rf $R`、`python -c "os.system(...)"` / `perl -e` / `awk BEGIN{system()}` 的内层语言、`(reboot)` 这类子 shell 分组，都是「换个写法这条命令里就看不到危险段」的形态，拦不住。`test_rw_blacklist_known_gaps` 把每一形态钉在用例里，别把它们当成已防住 —— 要封只能靠远端账号权限（见第 1 条）。
+7. 少数只读用法会被错杀：裸 `mount` 只是打印挂载表，但它和 `umount` 都在黑名单里，改用 `df` / `lsblk`。
