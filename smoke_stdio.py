@@ -18,7 +18,7 @@ HERE = Path(__file__).resolve().parent
 
 # list_hosts 该露的是「这台怎么配」，不是密钥本身。
 # 注意别用 blob 里搜字符串的写法判泄露：auth 的值就是 "password"（认证方式名），会假红。
-SECRET_FIELDS = {"password", "passphrase", "token", "secret", "private_key", "key_path"}
+SECRET_FIELDS = {"password", "passphrase", "token", "secret", "private_key", "key_path", "elevate_password"}
 
 
 def find_secret_fields(node, path="") -> list[str]:
@@ -101,6 +101,8 @@ def main() -> int:
         schemas = {t["name"]: t.get("inputSchema", {}).get("properties", {}) for t in tools}
         if "force" not in schemas.get("exec", {}):
             failures.append("exec 缺 force 参数")
+        if "elevate" not in schemas.get("exec", {}):
+            failures.append("exec 缺 elevate 参数")
         if "trust" not in schemas.get("pin_hostkey", {}):
             failures.append("pin_hostkey 缺 trust 参数")
         for name in ("grant", "revoke"):

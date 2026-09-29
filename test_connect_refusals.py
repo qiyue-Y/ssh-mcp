@@ -49,6 +49,7 @@ os.environ["SSHMCP_OUTPUT"] = str(_TMP / "output")
 os.environ["SSHMCP_POLICY"] = str(_POLICY)
 
 import ssh_mcp as M  # noqa: E402
+import output_store as OS  # noqa: E402
 
 REAL_IP = "10.81.2.100"
 WRONG_FP = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -280,7 +281,7 @@ CALLS: list[tuple] = []
 
 
 def fake_run(output_lines: int = 0):
-    def _run(cred, pin, command, cwd, idle_s, max_s, spill):
+    def _run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False):
         CALLS.append((cred.alias, pin, command, cwd, idle_s, max_s))
         for n in range(1, output_lines + 1):
             spill.write("out", f"row {n:05d} compiling\n".encode())
@@ -351,7 +352,7 @@ class ExecWiring(unittest.TestCase):
         write_hosts({"100": dict(PINNED)})
         seen = {}
 
-        def spy(cred, pin, command, cwd, idle_s, max_s, spill):
+        def spy(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False):
             seen["max_s"] = max_s
             seen["idle_s"] = idle_s
             spill.close()
@@ -363,6 +364,125 @@ class ExecWiring(unittest.TestCase):
         with mock.patch.object(M, "run_command", spy):
             M.execute("100", "cmake --build .")
         self.assertEqual(seen["max_s"], M.GUARD.get().max_duration_s)
+
+
+class Elevate(unittest.TestCase):
+    """提权：配置里 elevate 才是能力位，一旦提权，非 root 主机也恒查清单。"""
+
+    CRED = {"address": REAL_IP, "username": "qy", "auth": "password", "password": "login-secret", "hostKey": WRONG_FP}
+
+    def setUp(self):
+        reset_pins()
+
+    def test_not_configured_is_a_clean_block(self):
+        write_hosts({"100": dict(self.CRED)})
+        res = M.execute("100", "id", elevate=True)
+        self.assertTrue(res["blocked"])
+        self.assertEqual(res["reason"], "elevate_not_configured")
+        self.assertIn("elevate", res["hint"])
+
+    def test_elevate_forces_the_killlist_even_on_an_unguarded_host(self):
+        """100 既非 root 也没被 guarded_hosts 点名，但提权命令必须查表。"""
+        write_hosts({"100": {**self.CRED, "elevate": True}})
+        res = M.execute("100", "mkfs.ext4 /dev/sda1", elevate=True)
+        self.assertTrue(res["blocked"])
+        self.assertEqual(res["reason"], "killlisted")
+
+    def test_same_command_passes_without_elevate(self):
+        """反向对照：同一条命令不提权时不查表 —— 证明拦它的确实是 elevate 而不是别的。"""
+        write_hosts({"100": {**self.CRED, "elevate": True}})
+        CALLS.clear()
+        with mock.patch.object(M, "run_command", fake_run(0)):
+            res = M.execute("100", "mkfs.ext4 /dev/sda1")
+        self.assertFalse(res.get("blocked", False))
+
+    def test_sudo_wrap_keeps_the_password_out_of_argv(self):
+        cred = M.HostCred(alias="x", address="1", username="qy", password="login-secret", elevate=True)
+        inner = "cd '/root' && id"
+        wrapped = M._sudo_wrap(inner, cred)
+        self.assertIn("sudo -S -p '' --user root -- sh -c", wrapped)
+        self.assertNotIn("login-secret", wrapped, "口令绝不能进命令串（那会进 argv、审计和远端 history）")
+        # 引号必须被真正包住而不是拼漏：解析回来的 sh -c 参数要逐字等于原命令
+        import shlex
+
+        tokens = shlex.split(wrapped)
+        self.assertEqual(tokens[:7], ["sudo", "-S", "-p", "", "--user", "root", "--"])
+        self.assertEqual(tokens[7:], ["sh", "-c", inner])
+
+    def test_password_defaults_to_login_password(self):
+        plain = M.HostCred(alias="x", address="1", username="qy", password="login-secret", elevate=True)
+        self.assertEqual(plain.sudo_password(), "login-secret")
+        other = M.HostCred(alias="x", address="1", username="qy", password="login-secret", elevate=True, elevate_password="root-secret")
+        self.assertEqual(other.sudo_password(), "root-secret")
+
+    def test_elevate_without_any_password_is_blocked(self):
+        """空口令喂给 sudo -S 会一直等输入，最后报成 idle 超时 —— 那是假故障，提前拒。"""
+        write_hosts({"100": {"address": REAL_IP, "username": "qy", "auth": "key", "hostKey": WRONG_FP, "elevate": True}})
+        res = M.execute("100", "id", elevate=True)
+        self.assertTrue(res["blocked"])
+        self.assertEqual(res["reason"], "elevate_password_missing")
+
+    def test_channel_gets_password_on_stdin_not_in_command(self):
+        """run_command 的提权路径：exec 的是包装串，口令只从 stdin 走。"""
+        cred = M.HostCred(alias="100", address="1", username="qy", password="login-secret", elevate=True, host_key=WRONG_FP)
+        sent = {}
+
+        class FakeChan:
+            def exec_command(self, cmd):
+                sent["cmd"] = cmd
+
+            def sendall(self, data):
+                sent.setdefault("stdin", b"")
+                sent["stdin"] += data
+
+            def shutdown_write(self):
+                # 认证失败时 sudo 会再读一次 stdin，这里必须被关掉才不会挂到 idle 超时
+                sent["stdin_closed"] = True
+
+            def settimeout(self, _):
+                pass
+
+            def recv_ready(self):
+                return False
+
+            def recv_stderr_ready(self):
+                return False
+
+            def exit_status_ready(self):
+                return True
+
+            @property
+            def eof_received(self):
+                return True
+
+            def recv_exit_status(self):
+                return 0
+
+            def close(self):
+                pass
+
+        fake_client = mock.Mock()
+        fake_client.get_transport.return_value = mock.Mock(is_active=lambda: True, open_session=lambda: FakeChan())
+        spill = OS.Spill(M.OUTPUT_ROOT, "elevatestdin", 4096, {"out": (256, 256), "err": (256, 256)})
+        with mock.patch.object(M.POOL, "client", return_value=fake_client):
+            M.run_command(cred, WRONG_FP, "id", "~", 5, 5, spill, elevate=True)
+
+        self.assertIn("sudo -S", sent["cmd"])
+        self.assertNotIn("login-secret", sent["cmd"])
+        self.assertEqual(sent["stdin"], b"login-secret\n")
+        self.assertTrue(sent.get("stdin_closed"), "喂完口令必须关 stdin，否则错口令会挂到 idle 超时")
+
+    def test_audit_and_payload_mark_elevation_without_leaking(self):
+        write_hosts({"100": {**self.CRED, "elevate": True}})
+        with mock.patch.object(M, "run_command", fake_run(0)):
+            res = M.execute("100", "id -u", elevate=True)
+        self.assertTrue(res["elevated"])
+        self.assertEqual(res["ran_as"], "root")
+        recs = M.audit_tail("100", 20)
+        self.assertTrue(any(r.get("event") == "executed" and r.get("elevated") for r in recs))
+        blob = _AUDIT.read_text(encoding="utf-8") + json.dumps(res, ensure_ascii=False)
+        self.assertNotIn("login-secret", blob, "审计与返回值里绝不能出现口令")
+        self.assertNotIn("login-secret", json.dumps(M._tool_list_hosts(), ensure_ascii=False))
 
 
 class KilllistWiring(unittest.TestCase):
@@ -427,7 +547,7 @@ class KilllistWiring(unittest.TestCase):
         """单独的 cd 只改服务端记的 cwd，不触碰远端状态，root 主机也不必 force。"""
         write_hosts({"admin": dict(ROOT_PINNED)})
 
-        def pwd_run(cred, pin, command, cwd, idle_s, max_s, spill):
+        def pwd_run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False):
             spill.write("out", b"/tmp\n")
             spill.close()
             return M.RunResult(exit_code=0, stdout=spill.inline("out"), stderr="", truncated=False, timed_out=None, output_id=spill.run_id, stats=spill.stats())

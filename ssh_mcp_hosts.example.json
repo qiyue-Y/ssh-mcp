@@ -37,5 +37,29 @@
     "auth": "key",
     "hostKey": "SHA256:<服务器指纹>",
     "purpose": "私钥认证。key_path 可省略，缺省按 ~/.ssh/{id_ed25519,id_rsa,id_ecdsa,id_dsa} 顺序找。注意：带 passphrase 的私钥目前不支持，请先转成无口令或走 ssh-agent"
+  },
+
+  "example-elevate": {
+    "address": "10.0.0.14",
+    "port": 22,
+    "username": "deploy",
+    "auth": "password",
+    "password": "<填登录口令>",
+    "hostKey": "SHA256:<服务器指纹>",
+    "elevate": true,
+    "purpose": "开了 elevate 才能 exec(..., elevate=true)：服务端包成 sudo -S 并把口令写进 channel stdin（不进 argv/审计/history）。口令默认复用上面的 password —— sudo 校验的本来就是登录用户自己的口令，Ubuntu 这类机器通常不用再填 elevate_password"
+  },
+
+  "example-elevate-root-pw": {
+    "address": "10.0.0.15",
+    "port": 22,
+    "username": "ops",
+    "auth": "password",
+    "password": "<填登录口令>",
+    "hostKey": "SHA256:<服务器指纹>",
+    "elevate": true,
+    "elevate_user": "root",
+    "elevate_password": "<仅在提权口令与登录口令不同的机器上填>",
+    "purpose": "elevate_user 是 sudo --user 的目标，默认 root。提权命令一律查 killlist，不看 guarded_hosts"
   }
 }

@@ -10,6 +10,7 @@
 
 - **变更**：`ssh_policy.py`(566) → `ssh_guard.py`(~315)。ro 白名单 / rw 黑名单 / grant / CLI `grant`+`revoke` / Windows 确认框全部移除。`exec` 新增 `force`，`max_duration` 不再被服务端夹制，新增 `pin_hostkey` 工具（探测不发凭据，落盘要 `trust=true`，写本机 `hostkeys.json`）。可连主机从「policy.json + 凭据文件双白名单」改为「凭据文件里有这条即可」。
 - **查清单的主机**：`username == "root"` 恒查，非 root 由 `policy.json` 的 `guarded_hosts` 点名（当前点名：`66`）。
+- **提权（同日追加）**：`exec(..., elevate=true)` 把单条命令包成 `sudo -S -p '' --user <elevate_user> -- sh -c '<含 cd 前缀的整段>'`，口令写进 channel stdin。能力位在凭据文件（`elevate` / `elevate_user` / `elevate_password`，后两者可省，口令默认复用登录口令）。**提权命令一律查 killlist**，不看 `guarded_hosts`。
 - **理由（用户判定）**：命令过滤挡不住蓄意绕行的 AI，却给每条正常命令加一轮往返。保留的清单定位是**挡手滑**。
 - **随变更消失的旧条目**：裸 `mount` 被错杀（P2）、`policy.json` 与凭据双写造成的 `new8`/`admin` 缺条目摩擦、grant 对非 root 主机空转。
 - **仍未修的**：见下面两条 P1。
@@ -56,3 +57,11 @@
 
 - **`timed_out` 误报种类**：`wait = min(idle, 剩余时长)` 之后统一把 `socket.timeout` 记成 `idle`，于是传 `max_duration=1` 得到的也是 `idle`，调用方会以为自己的时长没生效。改成按「这一轮谁定的 wait」报 `duration`/`idle`（`_drain`）。别用 `monotonic() >= deadline` 判 —— 边界上会抖，真机第一次就是这么漏的。
 - **`read_output` 的 `grep` 是子串匹配不是正则**：`pattern="^199999$"` 命中 0 行。行为没改（改正则会让现有肌肉记忆失效），只把工具描述和 README 写清了。
+
+## 2026-09-29 · 提权口令错时会挂到 idle 超时（已修，勿回退）
+
+- **症状**：`elevate=true` 而口令不对时，命令阻塞 21s 才回来，且报的是 `timed_out: "idle"`、`exit_code: -1` —— 看起来像网络/空闲问题，其实是认证失败。
+- **根因**：`sudo -S` 认证失败后会**回头再读一次 stdin** 重试。我们只喂了一遍口令又没关 stdin，于是它一直等下一次输入。
+- **修法**：喂完口令立刻 `chan.shutdown_write()`，sudo 读到 EOF 即放弃。修后同一场景 **2.5s** 返回 `exit_code: 1`、`timed_out: null`、stderr 是 `sudo: Authentication failed, try again.`。
+- **代价**：提权命令自己的标准输入被关掉（`sh -c 'read x'` 会立刻拿到 EOF）。本服务没有交互输入能力，本来也喂不进东西，所以换得值。有 NOPASSWD 时多喂的那行口令会落进命令自己的 stdin —— 记在这里，别当新 bug。
+- **回归用例**：`Elevate.test_channel_gets_password_on_stdin_not_in_command` 断言 `stdin_closed`；口令只走 stdin 不进命令串由 `test_sudo_wrap_keeps_the_password_out_of_argv` 钉住（`shlex.split` 逐位解析回原命令，防引号拼漏）。

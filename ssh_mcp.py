@@ -122,14 +122,29 @@ class HostCred:
     key_path: str = ""
     host_key: str = ""
     purpose: str = ""
+    # 提权项：elevate=true 表示这台允许 exec(..., elevate=true) 以 root 跑单条命令。
+    # sudo 校验的是登录用户自己的口令，所以 elevate_password 留空就复用上面的 password；
+    # 只有「root 口令与登录口令不同」的机器才需要单独填。
+    elevate: bool = False
+    elevate_user: str = "root"
+    elevate_password: str = ""
 
     @property
     def privileged(self) -> bool:
         # root 账号恒查 killlist；非 root 要靠 policy.json 的 guarded_hosts 点名
         return self.username == "root"
 
+    def sudo_password(self) -> str:
+        return self.elevate_password or self.password
 
-_KEY_ALIASES = {"hostKey": "host_key", "hostkey": "host_key", "keyPath": "key_path"}
+
+_KEY_ALIASES = {
+    "hostKey": "host_key",
+    "hostkey": "host_key",
+    "keyPath": "key_path",
+    "elevateUser": "elevate_user",
+    "elevatePassword": "elevate_password",
+}
 
 
 def _load_hosts(raw: dict | None) -> dict[str, HostCred]:
@@ -495,9 +510,23 @@ def _drain(chan, idle_s: float, deadline: float, spill: OS.Spill) -> RunResult:
 NO_RETRY = ("AuthenticationException", "HostKeyMismatch", "BadAuthenticationType", "PasswordRequiredException")
 
 
-def run_command(cred: HostCred, pin: str, command: str, cwd: str, idle_s: float, max_s: float, spill: OS.Spill) -> RunResult:
+def _sudo_wrap(inner: str, cred: HostCred) -> str:
+    """把整段（含 cd 前缀）塞进一条 sudo -S。
+
+    `-p ''` 把口令提示置空，否则 "sudo: terminal required" 那类信息会污染 stderr。
+    口令本身走 channel stdin，不进 argv、不进本机审计、也不进远端 shell history。
+    """
+    target = cred.elevate_user or "root"
+    return f"sudo -S -p '' --user {shlex.quote(target)} -- sh -c {shlex.quote(inner)}"
+
+
+def run_command(cred: HostCred, pin: str, command: str, cwd: str, idle_s: float, max_s: float, spill: OS.Spill, elevate: bool = False) -> RunResult:
     """在远端执行一条命令。cwd 由服务端记录，发送前才拼上。"""
     sent = command if cwd in ("", "~") else f"cd {shlex.quote(cwd)} && {command}"
+    stdin: bytes | None = None
+    if elevate:
+        stdin = (cred.sudo_password() + "\n").encode("utf-8")
+        sent = _sudo_wrap(sent, cred)
     last_exc: Exception | None = None
     for attempt in range(2):
         try:
@@ -507,6 +536,15 @@ def run_command(cred: HostCred, pin: str, command: str, cwd: str, idle_s: float,
                 raise RuntimeError("transport 不可用")
             chan = transport.open_session()
             chan.exec_command(sent)
+            if stdin is not None:
+                # 必须紧跟 exec 之后立刻喂：sudo 的 -S 读不到就整条挂到 idle 超时
+                chan.sendall(stdin)
+                # 关掉 stdin：认证失败时 sudo 会回头再读一次重试，不关就阻塞到 idle 超时
+                # （实测错口令要挂 21s 才报 timed_out=idle，关掉后 sudo 立刻放弃并 exit 1）
+                try:
+                    chan.shutdown_write()
+                except Exception:  # noqa: BLE001 - 通道已被远端关闭时无需再管
+                    pass
             return _drain(chan, idle_s, time.monotonic() + max_s, spill)
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
@@ -579,16 +617,23 @@ def _preflight(alias: str, command: str) -> tuple[dict | None, HostCred | None, 
     return (None, cred, pin)
 
 
-def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None, force: bool = False) -> dict:
+def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None, force: bool = False, elevate: bool = False) -> dict:
     refusal, cred, pin = _preflight(alias, command)
     if refusal is not None:
         return refusal
 
+    if elevate and not cred.elevate:
+        return _block(alias, command, "elevate_not_configured", "no_elevate", f"凭据文件里为 {alias} 打开 elevate（那文件我不写）")
+    if elevate and not cred.sudo_password():
+        # 空口令喂进 stdin 会让 sudo 一直等输入，最后撞 idle 超时，报出来的还是假故障
+        return _block(alias, command, "elevate_password_missing", "no_elevate_password", f"elevate_password 与 password 都为空，在凭据文件里补一个")
+
     guard = GUARD.get()
     cd_target = _cd_only_segment(command)
-    # 清单查不查：root 账号恒查，非 root 看 policy.json 的 guarded_hosts 点没点名
+    # 清单查不查：root 账号恒查，非 root 看 guarded_hosts 点没点名，提权一律查 ——
+    # 一旦以 root 落地，破坏面和 root 账号完全同级，不该因为登录账号是 qy 就免检
     # 单独的 cd 只改服务端记的 cwd，不触碰远端状态，也不必查
-    guarded = G.applies(cred.privileged, alias, guard)
+    guarded = G.applies(cred.privileged, alias, guard) or elevate
     hit = None if cd_target is not None or not guarded else G.check(command, guard)
     if hit is not None and not force:
         return _block(alias, command, "killlisted", hit.rule, "确需执行请带 force=true 重发同一条命令")
@@ -596,7 +641,7 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
 
     # fail closed：审计写不进去就不执行
     try:
-        audit({"host": alias, "command": command, "event": "intent", "rule": rule, "guarded": guarded})
+        audit({"host": alias, "command": command, "event": "intent", "rule": rule, "guarded": guarded, "elevated": elevate or None})
     except OSError as exc:
         return _block(alias, command, "audit_write_failed", "audit_unwritable", f"审计目录不可写：{exc}")
 
@@ -614,12 +659,13 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
         log(f"output/ 轮转清理了 {removed} 个 run")
 
     if cd_target is not None:
-        res = run_command(cred, pin, f"cd {shlex.quote(cd_target)} && pwd", start_cwd, idle_s, max_s, spill)
+        # cd 的探活探测也按 elevate 走：`cd /root` 用主账号验会假失败，验过了才记 cwd
+        res = run_command(cred, pin, f"cd {shlex.quote(cd_target)} && pwd", start_cwd, idle_s, max_s, spill, elevate)
         end_cwd = res.stdout.strip().splitlines()[-1] if res.exit_code == 0 and res.stdout.strip() else start_cwd
         if res.exit_code == 0:
             POOL.set_cwd(alias, end_cwd)
     else:
-        res = run_command(cred, pin, command, start_cwd, idle_s, max_s, spill)
+        res = run_command(cred, pin, command, start_cwd, idle_s, max_s, spill, elevate)
         end_cwd = start_cwd
 
     audit(
@@ -629,12 +675,14 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
             "event": "executed",
             "reason": res.timed_out or "ok",
             "rule": rule,
+            "elevated": elevate or None,
+            "ran_as": (cred.elevate_user or "root") if elevate else None,
             "exit_code": res.exit_code,
             "output_id": res.output_id,
             "output": res.stats,
         }
     )
-    return _ok(alias, command, res, start_cwd, end_cwd, hit.rule if hit else None)
+    return _ok(alias, command, res, start_cwd, end_cwd, hit.rule if hit else None, elevate, cred.elevate_user or "root")
 
 
 def _block(alias: str, command: str, reason: str, rule: str, hint: str) -> dict:
@@ -645,7 +693,7 @@ def _block(alias: str, command: str, reason: str, rule: str, hint: str) -> dict:
     return {"host": alias, "command": command, "blocked": True, "reason": reason, "rule": rule, "hint": hint}
 
 
-def _ok(alias, command, res: RunResult, cwd_before, cwd_after, forced_rule: str | None = None) -> dict:
+def _ok(alias, command, res: RunResult, cwd_before, cwd_after, forced_rule: str | None = None, elevate: bool = False, ran_as: str = "root") -> dict:
     payload = {
         "host": alias,
         "command": command,
@@ -657,6 +705,9 @@ def _ok(alias, command, res: RunResult, cwd_before, cwd_after, forced_rule: str 
         "cwd_before": cwd_before,
         "cwd_after": cwd_after,
     }
+    if elevate:
+        payload["elevated"] = True
+        payload["ran_as"] = ran_as
     if forced_rule:
         payload["forced_rule"] = forced_rule
     if res.timed_out == "duration":
@@ -696,7 +747,10 @@ def _tool_list_hosts() -> dict:
                 "host_key_pinned": bool(pin),
                 "pin_source": source or None,
                 "guard": "killlist" if guarded else "none",
-                "guard_reason": "root 账号" if cred.privileged else ("guarded_hosts 点名" if guarded else ""),
+                "guard_reason": "root 账号" if cred.privileged else ("guarded_hosts 点名" if alias in guard.guarded_hosts else ""),
+                "elevate_available": cred.elevate,
+                "elevate_as": cred.elevate_user or "root",
+                "elevate_password_from": "elevate_password" if cred.elevate_password else ("password" if cred.password else "未配置"),
                 "connected": POOL.connected(alias),
                 "cwd": POOL.cwd(alias),
                 "limits": {
@@ -713,12 +767,12 @@ def _tool_list_hosts() -> dict:
         "killlist": [p.raw for p in guard.kill_prefixes],
         "guarded_hosts": sorted(guard.guarded_hosts),
         "unpinned": [a for a in sorted(creds) if not effective_pin(a, creds[a])[0]],
-        "note": "无权限控制：killlist（root 账号恒查 + guarded_hosts 点名的非 root 主机，exec 带 force=true 可越过）之外一律放行，真正的边界是远端账号自己的权限。被拦下的命令不会建立连接。",
+        "note": "无权限控制：killlist（root 账号恒查 + guarded_hosts 点名的非 root 主机 + 任何带 elevate 的命令，exec 用 force=true 可越过）之外一律放行，真正的边界是远端账号自己的权限。被拦下的命令不会建立连接。",
     }
 
 
-def _tool_exec(host: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None, force: bool = False) -> dict:
-    return execute(host, command, cwd, idle_timeout, max_duration, force)
+def _tool_exec(host: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None, force: bool = False, elevate: bool = False) -> dict:
+    return execute(host, command, cwd, idle_timeout, max_duration, force, elevate)
 
 
 def _tool_pin_hostkey(host: str, trust: bool = False) -> dict:
@@ -809,9 +863,11 @@ def build_server():
         name="exec",
         description=(
             "在远端执行一条离散命令（不开交互 shell）。服务端不做权限控制，命令原样交给远端 shell；"
-            "只有受保护主机（username=root，或被 policy.json 的 guarded_hosts 点名）会查一张自杀清单，"
-            "命中时带 force=true 即可放行。被拦下时不建立连接。"
+            "只有受保护主机（username=root，或被 policy.json 的 guarded_hosts 点名，或本次带 elevate）"
+            "会查一张自杀清单，命中时带 force=true 即可放行。被拦下时不建立连接。"
             "cwd 由服务端按主机记忆，可用参数覆盖；max_duration 传多大就用多大。"
+            "elevate=true 以 root 跑这一条（凭据里该主机须 elevate:true）——服务端用 sudo -S 并把口令写进"
+            "channel stdin，口令不进命令行、不进审计、不进远端 history；提权命令一律查清单。"
         ),
     )
     async def _exec(
@@ -821,11 +877,12 @@ def build_server():
         idle_timeout: float | None = None,
         max_duration: float | None = None,
         force: bool = False,
+        elevate: bool = False,
     ) -> dict:
         import anyio
 
         return await anyio.to_thread.run_sync(
-            lambda: _tool_exec(host, command, cwd, idle_timeout, max_duration, force)
+            lambda: _tool_exec(host, command, cwd, idle_timeout, max_duration, force, elevate)
         )
 
     @server.tool(
@@ -903,7 +960,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
             flags.append("password为空")
         print(
             f"  {alias:<8} {cred.username:<8} guard={'killlist' if G.applies(cred.privileged, alias, guard) else 'none':<8} "
-            f"pin={source or '-':<11} {' '.join(flags)}"
+            f"pin={source or '-':<11} elevate={'on' if cred.elevate else 'off':<4}({'+' if cred.elevate_password else '复用登录口令'}) {' '.join(flags)}"
         )
     try:
         AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -943,7 +1000,8 @@ def cmd_list(_: argparse.Namespace) -> int:
     for h in _tool_list_hosts()["hosts"]:
         print(
             f"{h['alias']:<8} {'root' if h['privileged'] else 'user':<5} guard={h['guard']:<8} "
-            f"pin={h['pin_source'] or '未固定':<10} connected={h['connected']} cwd={h['cwd']}  {h['purpose']}"
+            f"pin={h['pin_source'] or '未固定':<10} elevate={'on' if h['elevate_available'] else 'off':<3} "
+            f"connected={h['connected']} cwd={h['cwd']}  {h['purpose']}"
         )
     return 0
 

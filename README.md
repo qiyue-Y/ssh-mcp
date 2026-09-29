@@ -58,7 +58,7 @@ uv run --quiet smoke_stdio.py
 ## 配
 
 1. `copy ssh_mcp_hosts.example.json ssh_mcp_hosts.json`，填真实凭据。**这个文件我不读不写**，是红线。
-   可用字段：`address` `port` `username` `auth`（`password`/`key`）`password` `key_path` `hostKey` `purpose`。
+   可用字段：`address` `port` `username` `auth`（`password`/`key`）`password` `key_path` `hostKey` `purpose`，外加提权三项 `elevate` `elevate_user` `elevate_password`（见「提权」节）。
    旧字段 `rw_allowed` 已从模型里删掉；凭据文件里残留它会被静默忽略，不用你去清理（有用例钉着这个兼容行为）。
    `auth: "key"` 时 `key_path` 可省略，缺省按 `~/.ssh/{id_ed25519,id_rsa,id_ecdsa,id_dsa}` 顺序找。**带 passphrase 的文件私钥不支持**，此时改为问 ssh-agent 并取它的第一把 key（只取一把：逐把试认证会连着打远端的失败次数）。Windows 的 `ssh-agent` 服务默认是 Stopped/Disabled，要先 `Set-Service ssh-agent -StartupType Manual` 起服务再 `ssh-add`。
 2. `policy.json` 现在只剩三样：`defaults`（超时与输出上限）、`killlist`（25 条自杀清单）、`guarded_hosts`（非 root 主机里哪些也要查清单）。
@@ -84,9 +84,44 @@ uv run --quiet smoke_stdio.py
 - 凭据文件里已钉过 `hostKey` 且与实际不符 → 工具**拒绝覆盖**（返回 `writable: false`），那必须是主机重装或真中间人，由人自己改凭据文件。
 - `hostkeys.json` 只给凭据文件没钉的主机兜底；凭据里钉过就以凭据为准（`list_hosts` 的 `pin_source` 会告诉你是哪边）。
 
+## 提权（elevate）
+
+本服务**不开 PTY**，所以 `sudo su`、`sudo -i`、`su -` 这类要交互终端读口令的形态一律失败：
+
+```
+$ sudo su
+sudo: interactive authentication is required
+sudo: A terminal is required to authenticate      # 退出码 1
+```
+
+提权走的是**单条命令**形态：`exec(host, command, elevate=true)`，服务端把它包成
+
+```sh
+sudo -S -p '' --user root -- sh -c '<原命令，含 cd 前缀>'
+```
+
+`-S` 从 stdin 读口令，`-p ''` 把提示置空（否则 `[sudo] password for qy:` 会污染 stderr）。**口令由服务端写进 channel 的 stdin**，所以它不出现在命令串里 —— 不进远端 `argv`（`ps` 看不到）、不进本机审计、不进远端 shell history。真机硬证据：拿 100 跑 `id -u; id -un`，不提权得 `qy/1000`，提权得 `0/root`；再对审计文件、`output/*.log` 全文、返回值、`list_hosts` 四处搜口令，全部为否。
+
+凭据文件里的三个字段（那文件只有你能写）：
+
+| 字段 | 作用 |
+|---|---|
+| `elevate: true` | 能力位。没打开时 `elevate=true` 直接返回 `elevate_not_configured` |
+| `elevate_password` | **留空即复用登录口令**（`password`）。sudo 校验的本来就是登录用户自己的口令，所以 Ubuntu 这类机器通常什么都不用填 |
+| `elevate_user` | 提权目标，默认 `root` |
+
+两条配套行为：
+
+- **提权命令一律查 killlist**，无视主机是否在 `guarded_hosts` 里。命中照样可以 `force=true` 越过，审计记 `rule:"forced"` + `elevated:true`。
+- `cd` 的探活也跟着走提权 —— `cd /root` 用主账号验会假失败（实测 `exit_code: 1`，`权限不够`），验不过就不该把 cwd 记进去。
+
+口令错时不会挂死：喂完口令服务端立即 `shutdown_write()`，sudo 重试读到 EOF 就放弃。实测错口令 **2.5s** 返回 `exit_code: 1` + `sudo: Authentication failed`；不关 stdin 时它会阻塞到 idle 超时（实测 21s 才带着假的 `timed_out:"idle"` 回来）。
+
+副作用要清楚：关掉 stdin 意味着**提权命令自己读不到标准输入**（`sh -c 'read x'` 这类会立刻拿到 EOF）。本服务没有交互输入能力，本来也喂不进东西。另外远端得装了 `sudo` 且该用户在 sudoers 里；有 NOPASSWD 时我们多喂的那行口令会落到命令自己的 stdin。
+
 ## 拦截边界（Agent 必读）
 
-`exec(host, command, cwd?, idle_timeout?, max_duration?, force=false)` 对任何命令一律放行，只在**受保护主机**上查下面这三类形态。受保护 = `username == "root"`，或别名被 `policy.json` 的 `guarded_hosts` 点名（非 root 也挡一手手滑，比如跑共享业务的 `66`）。没点名的非 root 主机（当前是 `100`）零拦截。
+`exec(host, command, cwd?, idle_timeout?, max_duration?, force?, elevate?)` 对任何命令一律放行，只在**受保护主机**上查下面这三类形态。受保护 = `username == "root"`，或别名被 `policy.json` 的 `guarded_hosts` 点名（非 root 也挡一手手滑，比如跑共享业务的 `66`），或本次调用带 `elevate=true`（一旦落到 root，破坏面和 root 账号同级，不因登录账号是 `qy` 而免检）。没点名的非 root 主机（当前是 `100`）零拦截。
 
 | 类别 | 条目 |
 |---|---|
@@ -107,7 +142,7 @@ uv run --quiet smoke_stdio.py
 ## 工具
 
 - `list_hosts()` —— 主机、`pin_source`、是否查清单、限额。不含密码。
-- `exec(host, command, cwd?, idle_timeout?, max_duration?, force?)` —— 离散命令。被拦下时不建立连接。
+- `exec(host, command, cwd?, idle_timeout?, max_duration?, force?, elevate?)` —— 离散命令。被拦下时不建立连接。`elevate=true` 以 root 跑这一条（凭据里得先给这台开 `elevate`）。
 - `pin_hostkey(host, trust?)` —— 探测主机指纹；`trust=true` 才写 `hostkeys.json`。
 - `session_reset(host)` —— 丢连接与 cwd 重来。
 - `audit_tail(host?, limit?)` —— 回看最近审计（含被拦的）。
