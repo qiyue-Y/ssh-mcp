@@ -145,6 +145,30 @@ class DeliberatelyNotCaught(unittest.TestCase):
             self.assertFalse(blocked(c), f"设计上放行（防不住静态切片看不见的东西）：{c}")
 
 
+class GuardScope(unittest.TestCase):
+    """查不查这张表：root 恒查，非 root 看 guarded_hosts 点没点名。"""
+
+    CFG = G.GuardConfig(kill_prefixes=CFG.kill_prefixes, guarded_hosts=frozenset({"named"}))
+
+    def test_root_always_guarded(self):
+        self.assertTrue(G.applies(True, "anything", self.CFG))
+
+    def test_nonroot_guarded_only_when_named(self):
+        self.assertTrue(G.applies(False, "named", self.CFG))
+        self.assertFalse(G.applies(False, "unlisted", self.CFG))
+
+    def test_nonroot_host_still_blocked_when_named(self):
+        """非 root 只要点了名，判定内容与 root 主机完全一致。"""
+        self.assertTrue(G.check("rm -rf /", self.CFG) is not None)
+
+    def test_guarded_hosts_loaded_from_policy_json(self):
+        raw = json.loads((HERE / "policy.json").read_text(encoding="utf-8"))
+        loaded = G.load_guard(raw)
+        self.assertEqual(loaded.guarded_hosts, frozenset(raw.get("guarded_hosts") or []))
+        # 清单条目不能因为加了 guarded_hosts 就掉
+        self.assertEqual(len(loaded.kill_prefixes), len(CFG.kill_prefixes))
+
+
 class ConfigWiring(unittest.TestCase):
     def test_killlist_loaded_from_policy_json(self):
         self.assertGreaterEqual(len(CFG.kill_prefixes), 20)

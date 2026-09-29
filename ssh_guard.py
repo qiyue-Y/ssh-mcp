@@ -4,7 +4,10 @@
 
 原 `ssh_policy.py` 的 ro 白名单 / rw 黑名单 / grant / 包装器剥壳 / 解释器特判已全部移除
 （2026-09-29 决策：命令过滤挡不住蓄意绕行的 AI，代价是每轮往返）。这里只留三类
-「把自己搞死」形态：毁盘、锁在门外、把 ssh 关掉。非 root 主机完全不过这里。
+「把自己搞死」形态：毁盘、锁在门外、把 ssh 关掉。
+
+查不查这张表：`username == "root"` 的主机恒查；非 root 主机要在 `policy.json` 的
+`guarded_hosts` 里点名才查（比如跑着共享业务的机器，账号不是 root 也值得挡一手手滑）。
 """
 
 from __future__ import annotations
@@ -57,6 +60,7 @@ class GuardConfig:
     max_duration_s: float = 300.0
     max_output_bytes: int = 204800
     kill_prefixes: list[Prefix] = field(default_factory=list)
+    guarded_hosts: frozenset[str] = frozenset()
 
 
 class GuardSyntaxError(ValueError):
@@ -274,7 +278,13 @@ def load_guard(data: dict | None) -> GuardConfig:
         max_duration_s=float(defaults.get("max_duration_s", 300)),
         max_output_bytes=int(defaults.get("max_output_bytes", 204800)),
         kill_prefixes=parse_prefixes((data or {}).get("killlist") or []),
+        guarded_hosts=frozenset((data or {}).get("guarded_hosts") or []),
     )
+
+
+def applies(cred_privileged: bool, alias: str, config: GuardConfig) -> bool:
+    """root 账号恒查；非 root 只有在 guarded_hosts 里点名了才查。"""
+    return cred_privileged or alias in config.guarded_hosts
 
 
 def check(command: str, config: GuardConfig) -> Hit | None:

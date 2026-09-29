@@ -125,7 +125,7 @@ class HostCred:
 
     @property
     def privileged(self) -> bool:
-        # killlist 只对 root 账号主机生效：非特权账号能搞死的只有自己家目录
+        # root 账号恒查 killlist；非 root 要靠 policy.json 的 guarded_hosts 点名
         return self.username == "root"
 
 
@@ -586,15 +586,17 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
 
     guard = GUARD.get()
     cd_target = _cd_only_segment(command)
-    # 清单只管 root 账号主机；单独的 cd 只改服务端记的 cwd，不碰远端状态
-    hit = None if cd_target is not None or not cred.privileged else G.check(command, guard)
+    # 清单查不查：root 账号恒查，非 root 看 policy.json 的 guarded_hosts 点没点名
+    # 单独的 cd 只改服务端记的 cwd，不触碰远端状态，也不必查
+    guarded = G.applies(cred.privileged, alias, guard)
+    hit = None if cd_target is not None or not guarded else G.check(command, guard)
     if hit is not None and not force:
         return _block(alias, command, "killlisted", hit.rule, "确需执行请带 force=true 重发同一条命令")
     rule = "cd_only" if cd_target is not None else ("forced" if hit else "pass")
 
     # fail closed：审计写不进去就不执行
     try:
-        audit({"host": alias, "command": command, "event": "intent", "rule": rule, "privileged": cred.privileged})
+        audit({"host": alias, "command": command, "event": "intent", "rule": rule, "guarded": guarded})
     except OSError as exc:
         return _block(alias, command, "audit_write_failed", "audit_unwritable", f"审计目录不可写：{exc}")
 
@@ -682,6 +684,7 @@ def _tool_list_hosts() -> dict:
     for alias in sorted(creds):
         cred = creds[alias]
         pin, source = effective_pin(alias, cred)
+        guarded = G.applies(cred.privileged, alias, guard)
         hosts.append(
             {
                 "alias": alias,
@@ -692,7 +695,8 @@ def _tool_list_hosts() -> dict:
                 "auth": cred.auth,
                 "host_key_pinned": bool(pin),
                 "pin_source": source or None,
-                "guard": "killlist" if cred.privileged else "none",
+                "guard": "killlist" if guarded else "none",
+                "guard_reason": "root 账号" if cred.privileged else ("guarded_hosts 点名" if guarded else ""),
                 "connected": POOL.connected(alias),
                 "cwd": POOL.cwd(alias),
                 "limits": {
@@ -707,8 +711,9 @@ def _tool_list_hosts() -> dict:
     return {
         "hosts": hosts,
         "killlist": [p.raw for p in guard.kill_prefixes],
+        "guarded_hosts": sorted(guard.guarded_hosts),
         "unpinned": [a for a in sorted(creds) if not effective_pin(a, creds[a])[0]],
-        "note": "无权限控制：除 root 账号主机的 killlist（exec 带 force=true 可越过）外一律放行，真正的边界是远端账号自己的权限。被拦下的命令不会建立连接。",
+        "note": "无权限控制：killlist（root 账号恒查 + guarded_hosts 点名的非 root 主机，exec 带 force=true 可越过）之外一律放行，真正的边界是远端账号自己的权限。被拦下的命令不会建立连接。",
     }
 
 
@@ -796,7 +801,7 @@ def build_server():
     server_class = _import_highlevel_server()
     server = server_class("ssh-mcp")
 
-    @server.tool(name="list_hosts", description="列出凭据文件里的主机、指纹固定状态、killlist 与限额。不含任何密码。")
+    @server.tool(name="list_hosts", description="列出凭据文件里的主机、指纹固定状态、是否受 killlist 保护及其原因、限额。不含任何密码。")
     async def _list_hosts() -> dict:
         return _tool_list_hosts()
 
@@ -804,8 +809,9 @@ def build_server():
         name="exec",
         description=(
             "在远端执行一条离散命令（不开交互 shell）。服务端不做权限控制，命令原样交给远端 shell；"
-            "仅 root 账号主机会查一张自杀清单（killlist），命中时带 force=true 即可放行。"
-            "被拦下时不建立连接。cwd 由服务端按主机记忆，可用参数覆盖；max_duration 传多大就用多大。"
+            "只有受保护主机（username=root，或被 policy.json 的 guarded_hosts 点名）会查一张自杀清单，"
+            "命中时带 force=true 即可放行。被拦下时不建立连接。"
+            "cwd 由服务端按主机记忆，可用参数覆盖；max_duration 传多大就用多大。"
         ),
     )
     async def _exec(
@@ -884,7 +890,10 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         print(f"policy.json 解析失败：{exc}")
         return 1
     creds = HOSTS.get()
-    print(f"\n主机 {len(creds)} 台，killlist {len(guard.kill_prefixes)} 条（只对 username=root 的主机查）")
+    print(
+        f"\n主机 {len(creds)} 台，killlist {len(guard.kill_prefixes)} 条"
+        f"（root 账号恒查；非 root 只有 guarded_hosts 点名才查：{sorted(guard.guarded_hosts) or '空'}）"
+    )
     for alias, cred in sorted(creds.items()):
         pin, source = effective_pin(alias, cred)
         flags = []
@@ -892,7 +901,10 @@ def cmd_doctor(_: argparse.Namespace) -> int:
             flags.append("未固定指纹(pin_hostkey)")
         if cred.auth == "password" and not cred.password:
             flags.append("password为空")
-        print(f"  {alias:<8} {cred.username:<8} {'root' if cred.privileged else 'user':<5} pin={source or '-':<11} {' '.join(flags)}")
+        print(
+            f"  {alias:<8} {cred.username:<8} guard={'killlist' if G.applies(cred.privileged, alias, guard) else 'none':<8} "
+            f"pin={source or '-':<11} {' '.join(flags)}"
+        )
     try:
         AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
         probe = AUDIT_PATH.parent / ".write_probe"

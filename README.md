@@ -10,9 +10,9 @@
 
 服务现在只做三件事：**保持 SSH 连接**、**返回日志**、**注入密码**。
 
-唯一保留的拦截是一张 25 条的**自杀清单**（`policy.json` 的 `killlist`），且**只对 `username == "root"` 的主机生效**，命中后 `exec(force=true)` 一步就过。它的定位是「挡手滑的 AI」，不是「挡蓄意的 AI」：毁盘、把 ssh 关掉、把自己锁在门外这三类形态。
+唯一保留的拦截是一张 25 条的**自杀清单**（`policy.json` 的 `killlist`）：**`username == "root"` 的主机恒查**，非 root 主机要在 `policy.json` 的 `guarded_hosts` 里点名才查。命中后 `exec(force=true)` 一步就过。它的定位是「挡手滑的 AI」，不是「挡蓄意的 AI」：毁盘、把 ssh 关掉、把自己锁在门外这三类形态。
 
-`ssh_policy.py`(566 行) → `ssh_guard.py`(308 行)。删掉的 300 行全是反绕过机制（包装器剥壳、`sh -c` 递归复检、curl/wget 专项、解释器特判）。`grants.json`、CLI `grant`/`revoke`、Windows 原生确认框一并移除。
+`ssh_policy.py`(566 行) → `ssh_guard.py`(~315 行)。删掉的 300 行全是反绕过机制（包装器剥壳、`sh -c` 递归复检、curl/wget 专项、解释器特判）。`grants.json`、CLI `grant`/`revoke`、Windows 原生确认框一并移除。
 
 ## 它解决什么
 
@@ -61,7 +61,7 @@ uv run --quiet smoke_stdio.py
    可用字段：`address` `port` `username` `auth`（`password`/`key`）`password` `key_path` `hostKey` `purpose`。
    旧字段 `rw_allowed` 已从模型里删掉；凭据文件里残留它会被静默忽略，不用你去清理（有用例钉着这个兼容行为）。
    `auth: "key"` 时 `key_path` 可省略，缺省按 `~/.ssh/{id_ed25519,id_rsa,id_ecdsa,id_dsa}` 顺序找。**带 passphrase 的文件私钥不支持**，此时改为问 ssh-agent 并取它的第一把 key（只取一把：逐把试认证会连着打远端的失败次数）。Windows 的 `ssh-agent` 服务默认是 Stopped/Disabled，要先 `Set-Service ssh-agent -StartupType Manual` 起服务再 `ssh-add`。
-2. `policy.json` 现在只剩两样：`defaults`（超时与输出上限）和 `killlist`。
+2. `policy.json` 现在只剩三样：`defaults`（超时与输出上限）、`killlist`（25 条自杀清单）、`guarded_hosts`（非 root 主机里哪些也要查清单）。
 3. Qoder 里加 MCP（或手工写进 MCP 配置）：
 
 ```json
@@ -86,7 +86,7 @@ uv run --quiet smoke_stdio.py
 
 ## 拦截边界（Agent 必读）
 
-`exec(host, command, cwd?, idle_timeout?, max_duration?, force=false)` 对任何命令一律放行，除了 root 主机上的这三类形态：
+`exec(host, command, cwd?, idle_timeout?, max_duration?, force=false)` 对任何命令一律放行，只在**受保护主机**上查下面这三类形态。受保护 = `username == "root"`，或别名被 `policy.json` 的 `guarded_hosts` 点名（非 root 也挡一手手滑，比如跑共享业务的 `66`）。没点名的非 root 主机（当前是 `100`）零拦截。
 
 | 类别 | 条目 |
 |---|---|
@@ -146,10 +146,10 @@ uv run --quiet ssh_mcp.py list      # 主机、guard 是否生效、pin 来源�
 
 ## 已知边界
 
-1. **服务端不再做任何权限判断**（除 root 主机的 killlist）。同一台机器上「读一眼」和「`rm -rf`」的代价完全相同，唯一的地板是远端账号权限。`66` 原先靠 `rw_allowed: false` 被锁成只读，现在没有那层了。
+1. **服务端不再做任何权限判断**（除受保护主机的 killlist，而 force=true 一步就过）。同一台机器上「读一眼」和「`rm -rf`」的代价完全相同，唯一的地板是远端账号权限。`66` 原先靠 `rw_allowed: false` 被锁成只读，现在没有那层了 —— 它靠 `guarded_hosts` 点名换来的是「挡手滑」，不是「挡越权」。
 2. `hostkeys.json` 与凭据同属当前用户，Agent 用文件工具理论上能直接改它。`pin_hostkey` 的两步（探测 → `trust=true`）靠的是**约定和向用户回报**，不是强制。要硬边界就得把这个文件放到另一个 Windows 用户下，或全部改用非 root 账号。
 3. 静态分析有地板，见上面「设计上不再防的形态」。包装器与解释器的反绕过机制是主动删掉的，不是漏了。
 4. 引号内的 `>` `<` 已通过掩码排除；但 `grep a>b`（未加引号）里的 `>` 仍会被当成重定向目标去看一眼 —— 只有撞上那张敏感文件名单才拦，日常不会误杀。
 5. 密码解密后常驻服务进程内存。长期方案是全量转私钥认证。
-6. root 主机 + `force=true` 的链路只有离线用例（假 `run_command`）覆盖：唯一配置的 root 主机 `admin`（pve2）在凭据文件里没条目，而真机测试只允许在 100 上跑。要补的是凭据，不是代码。
+6. `username == "root"` 这一条判定分支没有真机证据：唯一配置的 root 主机 `admin`（pve2）在凭据文件里没条目，而真机测试只允许在 100 上跑。**「命中 → 拒且不建连 → force 送到远端 → 审计记 forced」整条链路已在 100 上用 `guarded_hosts` 点名真机验过**（`userdel` 不存在用户返回 exit 6，证明确实执行了），root 分支与非 root 点名分支在代码里是同一个 `G.applies` 谓词，只差那半行。要补的是 `admin` 的凭据，不是代码。
 7. 原先被错杀的只读用法现在都能跑了：裸 `mount`（只是打印挂载表）、`fdisk -l`、`docker system prune -af`、`kubectl delete`、`crontab -r`、`history -c`、`sudo`。

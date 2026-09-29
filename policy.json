@@ -5,6 +5,8 @@
     "max_output_bytes": 8388608
   },
 
+  "guarded_hosts": ["66"],
+
   "killlist": [
     "mkfs*",
     "wipefs",

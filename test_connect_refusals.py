@@ -22,15 +22,31 @@ from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 
+_REPO_GUARD = json.loads((HERE / "policy.json").read_text(encoding="utf-8"))
+
 # 必须在 import ssh_mcp 之前设好，模块在导入期读环境变量
 _TMP = Path(tempfile.mkdtemp(prefix="ssh-mcp-selftest-"))
 _HOSTS = _TMP / "hosts.json"
 _AUDIT = _TMP / "audit.jsonl"
+_POLICY = _TMP / "policy.json"
+# 清单条目跟着仓库走，guarded_hosts 钉死成用例自己的别名 ——
+# 否则用户哪天把 100 加进 guarded_hosts，"非 root 不拦"那条用例会跟着变红
+_POLICY.write_text(
+    json.dumps(
+        {
+            "defaults": _REPO_GUARD["defaults"],
+            "killlist": _REPO_GUARD["killlist"],
+            "guarded_hosts": ["guarded-user"],
+        },
+        ensure_ascii=False,
+    ),
+    encoding="utf-8",
+)
 os.environ["SSHMCP_HOSTS"] = str(_HOSTS)
 os.environ["SSHMCP_AUDIT"] = str(_AUDIT)
 os.environ["SSHMCP_HOSTKEYS"] = str(_TMP / "hostkeys.json")
 os.environ["SSHMCP_OUTPUT"] = str(_TMP / "output")
-os.environ["SSHMCP_POLICY"] = str(HERE / "policy.json")
+os.environ["SSHMCP_POLICY"] = str(_POLICY)
 
 import ssh_mcp as M  # noqa: E402
 
@@ -350,15 +366,39 @@ class ExecWiring(unittest.TestCase):
 
 
 class KilllistWiring(unittest.TestCase):
-    """清单只在 root 账号主机上生效，命中后 force=true 可越过。"""
+    """清单只在 root 主机或被 guarded_hosts 点名的主机上生效，命中后 force=true 可越过。"""
 
-    def test_nonroot_host_is_never_guarded(self):
+    def test_unnamed_nonroot_host_is_not_guarded(self):
+        """100 没被点名（用例自己的 policy 里只点了 guarded-user）→ 原样放行。"""
         write_hosts({"100": dict(PINNED)})
         CALLS.clear()
         with mock.patch.object(M, "run_command", fake_run(0)):
             res = M.execute("100", "rm -rf /")
         self.assertFalse(res.get("blocked", False))
         self.assertEqual(CALLS[-1][2], "rm -rf /", "命令原样发给远端，服务端没动它")
+
+    def test_named_nonroot_host_is_guarded(self):
+        """非 root 但被 guarded_hosts 点名：与 root 主机走同一张表，命中即拒。"""
+        write_hosts({"guarded-user": dict(PINNED)})
+        res = M.execute("guarded-user", "mkfs.ext4 /dev/sda1")
+        self.assertTrue(res["blocked"])
+        self.assertEqual(res["reason"], "killlisted")
+        self.assertIn("force=true", res["hint"])
+
+    def test_named_nonroot_host_can_be_forced(self):
+        write_hosts({"guarded-user": dict(PINNED)})
+        with mock.patch.object(M, "run_command", fake_run(0)):
+            res = M.execute("guarded-user", "mkfs.ext4 /dev/sda1", force=True)
+        self.assertEqual(res["forced_rule"], "deny:mkfs*")
+
+    def test_list_hosts_reports_why_a_host_is_guarded(self):
+        write_hosts({"guarded-user": dict(PINNED), "100": dict(PINNED), "admin": dict(ROOT_PINNED)})
+        data = M._tool_list_hosts()
+        by = {h["alias"]: h for h in data["hosts"]}
+        self.assertEqual((by["admin"]["guard"], by["admin"]["guard_reason"]), ("killlist", "root 账号"))
+        self.assertEqual((by["guarded-user"]["guard"], by["guarded-user"]["guard_reason"]), ("killlist", "guarded_hosts 点名"))
+        self.assertEqual((by["100"]["guard"], by["100"]["guard_reason"]), ("none", ""))
+        self.assertEqual(data["guarded_hosts"], ["guarded-user"])
 
     def test_root_host_hit_is_blocked_with_hint(self):
         write_hosts({"admin": dict(ROOT_PINNED)})
