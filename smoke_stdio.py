@@ -94,9 +94,18 @@ def main() -> int:
         tools = read_until(proc, 2).get("result", {}).get("tools", [])
         names = sorted(t["name"] for t in tools)
         print(f"tools/list  {time.monotonic() - t1:.2f}s  -> {names}")
-        for expect in ("audit_tail", "exec", "list_hosts", "read_output", "session_reset"):
+        for expect in ("audit_tail", "exec", "list_hosts", "pin_hostkey", "read_output", "session_reset"):
             if expect not in names:
                 failures.append(f"缺工具 {expect}")
+        # 解除权限控制后仍要在 schema 里：越清单的开关、探测指纹的确认位
+        schemas = {t["name"]: t.get("inputSchema", {}).get("properties", {}) for t in tools}
+        if "force" not in schemas.get("exec", {}):
+            failures.append("exec 缺 force 参数")
+        if "trust" not in schemas.get("pin_hostkey", {}):
+            failures.append("pin_hostkey 缺 trust 参数")
+        for name in ("grant", "revoke"):
+            if name in names:
+                failures.append(f"权限控制已解除，不该再有 {name}")
 
         send(proc, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "list_hosts", "arguments": {}}})
         res = read_until(proc, 3).get("result", {})
@@ -107,12 +116,17 @@ def main() -> int:
             failures.append(f"list_hosts 返回不是 JSON：{text[:200]}")
         else:
             hosts = payload.get("hosts", [])
-            print(f"list_hosts -> {len(hosts)} 台，allowlist {len(payload.get('ro_allowlist', []))} 条")
+            print(f"list_hosts -> {len(hosts)} 台，killlist {len(payload.get('killlist', []))} 条（仅 root 主机）")
             leaked = find_secret_fields(payload)
             if leaked:
                 failures.append(f"list_hosts 输出了密钥字段：{', '.join(leaked)}")
             for h in hosts:
-                print(f"   {h['alias']:<8} mode={h.get('effective_mode'):<12} {h.get('mode_reason', '')}")
+                print(
+                    f"   {h['alias']:<8} {'root' if h['privileged'] else 'user':<5} guard={h['guard']:<8} "
+                    f"pin={h['pin_source'] or '未固定':<10} {h['purpose']}"
+                )
+            if "rw_allowed" in text or "effective_mode" in text:
+                failures.append("list_hosts 还在输出已废弃的权限字段")
     finally:
         proc.stdin.close()
         proc.terminate()

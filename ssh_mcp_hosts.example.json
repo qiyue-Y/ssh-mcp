@@ -1,36 +1,33 @@
 {
-  "_说明": "复制成 ssh_mcp_hosts.json 后填真实凭据。本示例文件可以入库，真实凭据文件已被 .gitignore 挡住。",
+  "_说明": "复制成 ssh_mcp_hosts.json 后填真实凭据。本示例文件可以入库，真实凭据文件已被 .gitignore 挡住。2026-09-29 起不再有 rw_allowed 字段：凭据里有这台就连云端，命令一律交给远端 shell，服务端只在 username=root 时查一张自杀清单。",
 
-  "example-rw": {
+  "example-normal": {
     "address": "10.0.0.10",
     "port": 22,
     "username": "deploy",
     "auth": "password",
     "password": "<填口令>",
     "hostKey": "SHA256:<服务器指纹>",
-    "rw_allowed": true,
-    "purpose": "非特权 + rw_allowed -> 长期可写（黑名单仍生效）"
+    "purpose": "非特权账号：不查清单，能跑什么由这个账号在远端的权限决定"
   },
 
-  "example-ro": {
-    "address": "10.0.0.11",
-    "port": 22,
-    "username": "ops",
-    "auth": "password",
-    "password": "<填口令>",
-    "hostKey": "SHA256:<服务器指纹>",
-    "purpose": "不写 rw_allowed 就永远只读，grant 也解不开"
-  },
-
-  "example-root-needs-grant": {
+  "example-root": {
     "address": "10.0.0.12",
     "port": 22,
     "username": "root",
     "auth": "password",
     "password": "<填口令>",
     "hostKey": "SHA256:<服务器指纹>",
-    "rw_allowed": true,
-    "purpose": "root 账号默认只读，写操作需人工 grant（弹窗确认）"
+    "purpose": "root 账号：命中 policy.json 的 killlist 时先拒，exec 带 force=true 即放行"
+  },
+
+  "example-unpinned": {
+    "address": "10.0.0.11",
+    "port": 22,
+    "username": "ops",
+    "auth": "password",
+    "password": "<填口令>",
+    "purpose": "hostKey 留空则连不上。让 AI 调 pin_hostkey(host) 探测指纹、向你回报，核对后带 trust=true 落盘到 hostkeys.json（写不进本文件，凭据文件只有你能改）"
   },
 
   "example-key": {

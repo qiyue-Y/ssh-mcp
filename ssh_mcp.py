@@ -5,14 +5,17 @@
 #     "paramiko>=3.4",
 # ]
 # ///
-"""ssh-mcp —— 常驻 SSH 会话的 MCP 服务，带服务端策略与人工授权。
+"""ssh-mcp —— 常驻 SSH 会话的 MCP 服务：连接复用、全文日志、凭据注入。
+
+2026-09-29 起解除权限控制：原 ro 白名单 / rw 黑名单 / 人工 grant 三层判定全部移除
+（命令过滤挡不住蓄意绕行的 AI，却给每一条正常命令加了一轮往返）。服务端只在
+`username == "root"` 的主机上查一张自杀清单（policy.json 的 killlist），命中可由
+exec(force=true) 直接放行。真正的边界是远端账号自己的权限。
 
 用法：
     ssh_mcp.py [serve]                                  # 作为 MCP 服务跑（stdio）
     ssh_mcp.py doctor                                   # 检查配置与凭据
-    ssh_mcp.py list                                     # 列出主机与当前 mode
-    ssh_mcp.py grant 100 --scope host --for 30m         # 人工授权（必须 TTY）
-    ssh_mcp.py revoke 100 --all
+    ssh_mcp.py list                                     # 列出主机与指纹固定状态
 
 约定：stdout 被 MCP 协议独占，本文件所有日志一律走 stderr。
 """
@@ -30,8 +33,8 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -39,7 +42,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-import ssh_policy as P  # noqa: E402
+import ssh_guard as G  # noqa: E402
 import output_store as OS  # noqa: E402
 
 
@@ -51,10 +54,9 @@ def _path_from_env(var: str, default: Path) -> Path:
 HOME_DIR = _path_from_env("SSHMCP_HOME", HERE)
 POLICY_PATH = _path_from_env("SSHMCP_POLICY", HOME_DIR / "policy.json")
 HOSTS_PATH = _path_from_env("SSHMCP_HOSTS", HOME_DIR / "ssh_mcp_hosts.json")
-GRANTS_PATH = _path_from_env("SSHMCP_GRANTS", HOME_DIR / "grants.json")
+HOSTKEYS_PATH = _path_from_env("SSHMCP_HOSTKEYS", HOME_DIR / "hostkeys.json")
 AUDIT_PATH = _path_from_env("SSHMCP_AUDIT", HOME_DIR / "audit" / "ssh-mcp.jsonl")
 OUTPUT_ROOT = _path_from_env("SSHMCP_OUTPUT", HOME_DIR / "output")
-CONFIRM_TIMEOUT = int(os.environ.get("SSHMCP_CONFIRM_TIMEOUT", "120"))
 
 # 回给 Agent 的内联预算（字节）。全文在 output/ 里，想看随时 read_output 捞。
 INLINE_OUT = (4096, 4096)
@@ -77,7 +79,7 @@ def iso(dt: datetime) -> str:
 
 
 # --------------------------------------------------------------------------------------
-# 配置：policy 与 grants 都按 mtime 热加载，grant 完不必重启服务
+# 配置：limits/killlist 与 hostkeys 都按 mtime 热加载，改完不必重启服务
 # --------------------------------------------------------------------------------------
 
 
@@ -119,20 +121,12 @@ class HostCred:
     password: str = ""
     key_path: str = ""
     host_key: str = ""
-    rw_allowed: bool = False
     purpose: str = ""
 
     @property
     def privileged(self) -> bool:
-        # SPEC §8 决议：只按 username 判，不做远端探测。
+        # killlist 只对 root 账号主机生效：非特权账号能搞死的只有自己家目录
         return self.username == "root"
-
-    def public(self) -> dict:
-        data = asdict(self)
-        data.pop("password", None)
-        data["privileged"] = self.privileged
-        data["host_key_pinned"] = bool(self.host_key)
-        return data
 
 
 _KEY_ALIASES = {"hostKey": "host_key", "hostkey": "host_key", "keyPath": "key_path"}
@@ -155,72 +149,40 @@ def _load_hosts(raw: dict | None) -> dict[str, HostCred]:
     return out
 
 
-POLICY = CachedJson(POLICY_PATH, lambda raw: P.load_policy(raw or {}))
+GUARD = CachedJson(POLICY_PATH, G.load_guard)
 HOSTS = CachedJson(HOSTS_PATH, _load_hosts)
 
 
-@dataclass
-class GrantFile:
-    grants: list[P.Grant] = field(default_factory=list)
+def _load_pins(raw: dict | None) -> dict[str, str]:
+    """alias -> SHA256:xxx。只给凭据文件里没钉 hostKey 的主机兜底。"""
+    return {k: str(v) for k, v in (raw or {}).items() if not k.startswith("_")}
 
 
-def _load_grants(raw: dict | None) -> GrantFile:
-    grants: list[P.Grant] = []
-    for item in (raw or {}).get("grants", []):
-        known = {f for f in P.Grant.__dataclass_fields__}
-        grants.append(P.Grant(**{k: v for k, v in item.items() if k in known}))
-    return GrantFile(grants=grants)
+PINS = CachedJson(HOSTKEYS_PATH, _load_pins)
 
 
-GRANTS = CachedJson(GRANTS_PATH, _load_grants)
+def save_pin(alias: str, fingerprint: str) -> None:
+    HOSTKEYS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    data = dict(PINS.get())
+    data[alias] = fingerprint
+    tmp = HOSTKEYS_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, HOSTKEYS_PATH)
+    PINS._mtime = None  # 强制下次重读
 
 
-def save_grants(store: GrantFile) -> None:
-    GRANTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"grants": [asdict(g) for g in store.grants]}
-    tmp = GRANTS_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, GRANTS_PATH)
-    GRANTS._mtime = None  # 强制下次重读
-
-
-def grants_for(alias: str) -> list[P.Grant]:
-    return [g for g in GRANTS.get().grants if g.alias == alias and g.is_live()]
+def effective_pin(alias: str, cred: HostCred | None) -> tuple[str, str]:
+    """返回 (指纹, 来源)。凭据文件优先 —— 那里钉过就得由人去改，AI 写的 pin 不算。"""
+    if cred is not None and cred.host_key:
+        return cred.host_key, "credential"
+    pin = PINS.get().get(alias, "")
+    return (pin, "hostkeys") if pin else ("", "")
 
 
 # --------------------------------------------------------------------------------------
-# 权限判定
+# 自杀清单：只对 username == "root" 的主机查（见 execute）
 # --------------------------------------------------------------------------------------
 
-
-@dataclass
-class ModeInfo:
-    mode: str
-    reason: str
-    grant: P.Grant | None = None
-
-
-def long_lived_mode(cred: HostCred) -> ModeInfo:
-    if not cred.rw_allowed:
-        return ModeInfo("ro", "rw_allowed 未设置 → 一律只读")
-    if not cred.privileged:
-        return ModeInfo("rw", "非 root + rw_allowed → 长期可写")
-    return ModeInfo("ro", "root 账号：需人工 grant 才可写")
-
-
-def resolve_mode(alias: str, command: str, cred: HostCred) -> ModeInfo:
-    base = long_lived_mode(cred)
-    if base.mode == "rw":
-        return base
-    if not cred.rw_allowed:
-        return base
-    for grant in grants_for(alias):
-        if grant.scope == "host":
-            return ModeInfo("rw", f"host grant {grant.id}（TTL 内）", grant)
-    for grant in grants_for(alias):
-        if grant.scope == "cmd" and P.grant_matches(grant, command, POLICY.get()):
-            return ModeInfo("rw", f"cmd grant {grant.id} 命中前缀 {grant.command!r}", grant)
-    return ModeInfo(base.mode, base.reason + "；无有效 grant")
 
 
 # --------------------------------------------------------------------------------------
@@ -265,6 +227,30 @@ def sha256_fingerprint(key) -> str:
     return f"SHA256:{digest.rstrip('=')}"
 
 
+def probe_hostkey(address: str, port: int = 22, timeout: float = 10.0) -> tuple[str, str]:
+    """只走到密钥交换为止取对方主机密钥，一个凭据都不发。
+
+    这是 pin_hostkey 能安全交给 AI 的前提：探测阶段不提交用户名/密码，
+    所以即便对端是台冒充的机器，密码也不会漏出去。
+    """
+    import paramiko
+
+    sock = socket.create_connection((address, port), timeout=timeout)
+    transport = None
+    try:
+        transport = paramiko.Transport(sock)
+        transport.start_client(timeout=timeout)
+        key = transport.get_remote_server_key()
+        return sha256_fingerprint(key), key.get_name()
+    finally:
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception:  # noqa: BLE001 - 探测收尾的断开失败不影响已取到的密钥
+                pass
+        sock.close()
+
+
 class HostKeyMismatch(Exception):
     pass
 
@@ -278,7 +264,7 @@ def _build_pinned_policy(expected: str):
             if expected and got != expected:
                 raise HostKeyMismatch(f"{hostname} 指纹不匹配：期望 {expected}，实际 {got}")
             if not expected:
-                raise HostKeyMismatch(f"{hostname} 未在凭据里钉 hostKey，拒绝连接")
+                raise HostKeyMismatch(f"{hostname} 未固定主机指纹，拒绝连接（先调 pin_hostkey）")
 
     return _Pinned()
 
@@ -345,11 +331,11 @@ class Pool:
     def set_cwd(self, alias: str, path: str) -> None:
         self._cwd[alias] = path
 
-    def _connect(self, cred: HostCred):
+    def _connect(self, cred: HostCred, pin: str):
         import paramiko
 
         client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(_build_pinned_policy(cred.host_key))
+        client.set_missing_host_key_policy(_build_pinned_policy(pin))
         kwargs = {
             "hostname": cred.address,
             "port": cred.port,
@@ -374,14 +360,14 @@ class Pool:
             transport.set_keepalive(30)
         return client
 
-    def client(self, cred: HostCred, reconnect: bool = False):
+    def client(self, cred: HostCred, pin: str, reconnect: bool = False):
         existing = self._clients.get(cred.alias)
         if existing is not None and not reconnect:
             transport = existing.get_transport()
             if transport is not None and transport.is_active():
                 return existing
             self.close(cred.alias)
-        client = self._connect(cred)
+        client = self._connect(cred, pin)
         self._clients[cred.alias] = client
         return client
 
@@ -435,7 +421,10 @@ def _drain(chan, idle_s: float, deadline: float, spill: OS.Spill) -> RunResult:
             timed_out = "duration"
             why = "duration"
             break
-        chan.settimeout(min(idle_s, remaining))
+        # 这一轮 wait 由谁定，超时就该算成谁：拿 monotonic() 和 deadline 比会踩在边界上抖动
+        wait = min(idle_s, remaining)
+        bound = "duration" if remaining <= idle_s else "idle"
+        chan.settimeout(wait)
         try:
             if chan.recv_ready():
                 take(chan.recv(65536), False)
@@ -450,8 +439,10 @@ def _drain(chan, idle_s: float, deadline: float, spill: OS.Spill) -> RunResult:
                 break
             chunk = chan.recv(65536)  # 无数据时阻塞，超时抛 socket.timeout —— 即 idle
         except socket.timeout:
-            timed_out = "idle"
-            why = "idle"
+            # recv 超时是 min(idle, 剩余时长)，先到哪个就算哪种：
+            # 传小 max_duration 时报成 idle 会让调用方以为自己的时长没生效
+            timed_out = bound
+            why = bound
             break
         except (socket.error, OSError) as exc:
             take(f"\n[ssh-mcp] 通道异常：{type(exc).__name__}: {exc}".encode(), True)
@@ -504,13 +495,13 @@ def _drain(chan, idle_s: float, deadline: float, spill: OS.Spill) -> RunResult:
 NO_RETRY = ("AuthenticationException", "HostKeyMismatch", "BadAuthenticationType", "PasswordRequiredException")
 
 
-def run_command(cred: HostCred, command: str, cwd: str, idle_s: float, max_s: float, spill: OS.Spill) -> RunResult:
-    """在远端执行一条命令。cwd 由服务端记录，发送前才拼上，不参与策略判定。"""
+def run_command(cred: HostCred, pin: str, command: str, cwd: str, idle_s: float, max_s: float, spill: OS.Spill) -> RunResult:
+    """在远端执行一条命令。cwd 由服务端记录，发送前才拼上。"""
     sent = command if cwd in ("", "~") else f"cd {shlex.quote(cwd)} && {command}"
     last_exc: Exception | None = None
     for attempt in range(2):
         try:
-            client = POOL.client(cred, reconnect=attempt > 0)
+            client = POOL.client(cred, pin, reconnect=attempt > 0)
             transport = client.get_transport()
             if transport is None or not transport.is_active():
                 raise RuntimeError("transport 不可用")
@@ -548,127 +539,114 @@ def run_command(cred: HostCred, command: str, cwd: str, idle_s: float, max_s: fl
 
 def _cd_only_segment(command: str) -> str | None:
     try:
-        tokens = P.tokenize(command)
-    except P.PolicySyntaxError:
+        tokens = G.tokenize(G.split_separators(command))
+    except G.GuardSyntaxError:
         return None
-    segments = P.split_segments(tokens)
+    segments = G.split_segments(tokens)
     if len(segments) != 1 or len(segments[0]) != 2 or segments[0][0] != "cd":
         return None
     return segments[0][1]
 
 
-def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None) -> dict:
-    policy = POLICY.get()
-    if alias not in policy.hosts:
-        return _refuse(alias, command, "unknown_host", "not_in_policy", "主机不在 policy.json 的 hosts 白名单里，即使凭据文件有这台也不给连", "ro")
+def _preflight(alias: str, command: str) -> tuple[dict | None, HostCred | None, str]:
+    """凭据与指纹两道前置检查：任一不过就不建立连接，也就不会把密码发出去。"""
     cred = HOSTS.get().get(alias)
     if cred is None:
-        return _refuse(
-            alias,
-            command,
-            "credential_missing",
-            "no_credential",
-            f"凭据文件 {HOSTS_PATH} 里缺 {alias} 这一条，请你自行补上（我不读不写该文件）",
-            "ro",
+        return (
+            _block(
+                alias,
+                command,
+                "credential_missing",
+                "no_credential",
+                f"凭据文件 {HOSTS_PATH} 里缺 {alias} 这一条，请你自行补上（我不读不写该文件）",
+            ),
+            None,
+            "",
         )
-    if not cred.host_key:
-        return _refuse(alias, command, "host_key_unpinned", "no_hostKey", f"请在凭据里为 {alias} 填 hostKey 指纹", "ro")
+    pin, _ = effective_pin(alias, cred)
+    if not pin:
+        return (
+            _block(
+                alias,
+                command,
+                "host_key_unpinned",
+                "no_hostKey",
+                f"调 pin_hostkey(host='{alias}') 取实际指纹，报给用户核对后带 trust=true 再调一次写入",
+            ),
+            None,
+            "",
+        )
+    return (None, cred, pin)
 
-    mode_info = resolve_mode(alias, command, cred)
+
+def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None, force: bool = False) -> dict:
+    refusal, cred, pin = _preflight(alias, command)
+    if refusal is not None:
+        return refusal
+
+    guard = GUARD.get()
     cd_target = _cd_only_segment(command)
-    if cd_target is None:
-        decision = P.decide(command, mode_info.mode, policy)
-        if not decision.allowed:
-            return _refuse(alias, command, decision.reason, decision.matched_rule, _hint_for(decision, cred, mode_info), mode_info.mode)
-    else:
-        # 单独的 cd 只改服务端记的 cwd，不触碰远端状态，两种 mode 都放行
-        decision = P.Decision(True, matched_rule="cd_only", segments=[["cd", cd_target]])
+    # 清单只管 root 账号主机；单独的 cd 只改服务端记的 cwd，不碰远端状态
+    hit = None if cd_target is not None or not cred.privileged else G.check(command, guard)
+    if hit is not None and not force:
+        return _block(alias, command, "killlisted", hit.rule, "确需执行请带 force=true 重发同一条命令")
+    rule = "cd_only" if cd_target is not None else ("forced" if hit else "pass")
 
     # fail closed：审计写不进去就不执行
     try:
-        audit({"host": alias, "command": command, "decision": "intent", "reason": "ok", "matched_rule": decision.matched_rule, "mode": mode_info.mode, "grant_id": mode_info.grant.id if mode_info.grant else None, "stage": "intent"})
+        audit({"host": alias, "command": command, "event": "intent", "rule": rule, "privileged": cred.privileged})
     except OSError as exc:
-        return _refuse(alias, command, "audit_write_failed", "audit_unwritable", f"审计目录不可写：{exc}", mode_info.mode)
+        return _block(alias, command, "audit_write_failed", "audit_unwritable", f"审计目录不可写：{exc}")
 
-    idle_s = float(idle_timeout or policy.idle_timeout_s)
-    max_s = min(float(max_duration or policy.max_duration_s), policy.max_duration_s)
+    idle_s = float(idle_timeout or guard.idle_timeout_s)
+    max_s = float(max_duration or guard.max_duration_s)
     start_cwd = cwd or POOL.cwd(alias)
 
     # 全文落盘和审计同级：写不了就不执行，别把输出留在只有内存知道的地方
     try:
-        spill = OS.Spill(OUTPUT_ROOT, uuid.uuid4().hex, policy.max_output_bytes, {"out": INLINE_OUT, "err": INLINE_ERR})
+        spill = OS.Spill(OUTPUT_ROOT, uuid.uuid4().hex, guard.max_output_bytes, {"out": INLINE_OUT, "err": INLINE_ERR})
     except OSError as exc:
-        return _refuse(alias, command, "output_unwritable", "output_unwritable", f"output 目录不可写：{exc}（全文日志与审计同为必备件）", mode_info.mode)
+        return _block(alias, command, "output_unwritable", "output_unwritable", f"output 目录不可写：{exc}（全文日志与审计同为必备件）")
     removed = OS.prune(OUTPUT_ROOT, OUTPUT_KEEP_RUNS, OUTPUT_KEEP_BYTES, OUTPUT_KEEP_DAYS)
     if removed:
         log(f"output/ 轮转清理了 {removed} 个 run")
 
     if cd_target is not None:
-        res = run_command(cred, f"cd {shlex.quote(cd_target)} && pwd", start_cwd, idle_s, max_s, spill)
+        res = run_command(cred, pin, f"cd {shlex.quote(cd_target)} && pwd", start_cwd, idle_s, max_s, spill)
         end_cwd = res.stdout.strip().splitlines()[-1] if res.exit_code == 0 and res.stdout.strip() else start_cwd
         if res.exit_code == 0:
             POOL.set_cwd(alias, end_cwd)
     else:
-        res = run_command(cred, command, start_cwd, idle_s, max_s, spill)
+        res = run_command(cred, pin, command, start_cwd, idle_s, max_s, spill)
         end_cwd = start_cwd
 
-    broad = mode_info.grant is not None and P.broad_grant_hit(decision.segments, policy)
-    if mode_info.grant is not None and mode_info.grant.scope == "cmd":
-        _consume_grant(mode_info.grant)
     audit(
         {
             "host": alias,
             "command": command,
-            "decision": "executed",
+            "event": "executed",
             "reason": res.timed_out or "ok",
-            "matched_rule": decision.matched_rule,
-            "mode": mode_info.mode,
+            "rule": rule,
             "exit_code": res.exit_code,
             "output_id": res.output_id,
             "output": res.stats,
-            "grant_id": mode_info.grant.id if mode_info.grant else None,
-            "broad_grant": broad or None,
-            "stage": "result",
         }
     )
-    return _ok(alias, command, res, start_cwd, end_cwd, mode_info, decision, broad)
+    return _ok(alias, command, res, start_cwd, end_cwd, hit.rule if hit else None)
 
 
-def _refuse(alias: str, command: str, reason: str, rule: str, hint: str, mode: str) -> dict:
+def _block(alias: str, command: str, reason: str, rule: str, hint: str) -> dict:
     try:  # 被拒也要留痕，但拒本身不需要 fail closed
-        audit({"host": alias, "command": command, "decision": "deny", "reason": reason, "matched_rule": rule, "mode": mode, "stage": "result"})
+        audit({"host": alias, "command": command, "event": "blocked", "reason": reason, "rule": rule})
     except OSError as exc:
         log(f"审计写入失败：{exc}")
-    return _denied(alias, command, reason, hint, rule, mode)
+    return {"host": alias, "command": command, "blocked": True, "reason": reason, "rule": rule, "hint": hint}
 
 
-def _consume_grant(grant: P.Grant) -> None:
-    store = GRANTS.get()
-    target = next((g for g in store.grants if g.id == grant.id), None)
-    if target is None:
-        return
-    target.consume()
-    if target.uses_left == 0:
-        store.grants.remove(target)
-    save_grants(store)
-
-
-def _denied(alias: str, command: str, reason: str, hint: str, rule: str = "", mode: str = "ro") -> dict:
-    return {
-        "allowed": False,
+def _ok(alias, command, res: RunResult, cwd_before, cwd_after, forced_rule: str | None = None) -> dict:
+    payload = {
         "host": alias,
         "command": command,
-        "reason": reason,
-        "matched_rule": rule,
-        "mode": mode,
-        "hint": hint,
-    }
-
-
-def _ok(alias, command, res: RunResult, cwd_before, cwd_after, mode_info: ModeInfo, decision, broad=False) -> dict:
-    payload = {
-        "allowed": True,
-        "host": alias,
         "exit_code": res.exit_code,
         "stdout": res.stdout,
         "stderr": res.stderr,
@@ -676,17 +654,11 @@ def _ok(alias, command, res: RunResult, cwd_before, cwd_after, mode_info: ModeIn
         "timed_out": res.timed_out,
         "cwd_before": cwd_before,
         "cwd_after": cwd_after,
-        "decision": {
-            "allowed": True,
-            "mode": mode_info.mode,
-            "mode_reason": mode_info.reason,
-            "matched_rule": decision.matched_rule,
-            "grant_id": mode_info.grant.id if mode_info.grant else None,
-            "broad_grant": bool(broad),
-        },
     }
+    if forced_rule:
+        payload["forced_rule"] = forced_rule
     if res.timed_out == "duration":
-        payload["hint"] = "撞到 max_duration：静默长任务应改用 detach（M2 提供）"
+        payload["hint"] = "撞到 max_duration：命令可能还在远端跑，已收的部分可 read_output 捞；要等完就传更大的 max_duration"
     if res.output_id:
         payload["output_id"] = res.output_id
         payload["output"] = res.stats
@@ -698,81 +670,90 @@ def _ok(alias, command, res: RunResult, cwd_before, cwd_after, mode_info: ModeIn
     return payload
 
 
-def _hint_for(decision, cred: HostCred, mode_info: ModeInfo) -> str:
-    # 能力位是第一层：rw_allowed 为假时 resolve_mode 根本不查 grant，叫 Agent 去 grant 是死路
-    if not cred.rw_allowed and decision.reason in (
-        "not_in_allowlist",
-        "redirect_not_allowed_in_ro",
-        "command_substitution_not_allowed_in_ro",
-        "interpreter_not_allowed_in_ro",
-        "secret_path_not_readable_in_ro",
-    ):
-        return f"{cred.alias} 凭据未设 rw_allowed，grant 解不开只读（CLI grant 同样会拒）。要写请先在凭据文件里为 {cred.alias} 打开 rw_allowed"
-    if decision.reason == "not_in_allowlist":
-        return f"{cred.alias} 当前只读。要执行请申请 grant：grant {cred.alias} --scope cmd --cmd \"<命令>\" --for 30m"
-    if decision.reason in ("redirect_not_allowed_in_ro", "command_substitution_not_allowed_in_ro", "interpreter_not_allowed_in_ro"):
-        return f"{cred.alias} 只读模式下禁止该形态。若确需写入请申请 grant：grant {cred.alias} --scope host --for 30m"
-    if decision.reason == "denylisted":
-        return f"命中 rw 硬黑名单 {decision.matched_rule}，grant 也解不开"
-    if decision.reason == "secret_path_not_readable_in_ro":
-        return "该路径在 ro 下不可读（私钥/shadow/sudoers 类）。需要读请临时给 host scope grant"
-    return mode_info.reason
-
-
 # --------------------------------------------------------------------------------------
 # MCP 工具
 # --------------------------------------------------------------------------------------
 
 
 def _tool_list_hosts() -> dict:
-    policy = POLICY.get()
+    guard = GUARD.get()
     creds = HOSTS.get()
     hosts = []
-    for alias in policy.aliases:
-        cred = creds.get(alias)
-        entry = {"alias": alias, **(policy.hosts.get(alias) or {})}
-        if cred is None:
-            entry.update({"credential_present": False, "effective_mode": "unreachable", "mode_reason": "凭据文件里缺这一条"})
-            hosts.append(entry)
-            continue
-        mode_info = long_lived_mode(cred)
-        live = [g for g in grants_for(alias)]
-        entry.update(
+    for alias in sorted(creds):
+        cred = creds[alias]
+        pin, source = effective_pin(alias, cred)
+        hosts.append(
             {
-                "credential_present": True,
+                "alias": alias,
+                "purpose": cred.purpose,
                 "address": f"{cred.address}:{cred.port}",
                 "username": cred.username,
                 "privileged": cred.privileged,
                 "auth": cred.auth,
-                "host_key_pinned": bool(cred.host_key),
-                "rw_allowed": cred.rw_allowed,
-                "effective_mode": mode_info.mode,
-                "mode_reason": mode_info.reason,
-                "grant_expires_at": max((g.expires_at or "" for g in live), default=None),
-                "grant_count": len(live),
+                "host_key_pinned": bool(pin),
+                "pin_source": source or None,
+                "guard": "killlist" if cred.privileged else "none",
                 "connected": POOL.connected(alias),
                 "cwd": POOL.cwd(alias),
                 "limits": {
-                    "idle_timeout_s": policy.idle_timeout_s,
-                    "max_duration_s": policy.max_duration_s,
-                    "max_output_file_bytes": policy.max_output_bytes,
+                    "idle_timeout_s": guard.idle_timeout_s,
+                    "max_duration_s": f"{guard.max_duration_s}（缺省，可被 max_duration 参数任意覆盖，不再夹制）",
+                    "max_output_file_bytes": guard.max_output_bytes,
                     "inline_output": f"stdout 头 {INLINE_OUT[0]}B + 尾 {INLINE_OUT[1]}B（stderr {INLINE_ERR[0]}/{INLINE_ERR[1]}），全文用 read_output(output_id) 回捞",
                     "output_retention": f"{OUTPUT_KEEP_DAYS} 天 / ≤{OUTPUT_KEEP_RUNS} run / ≤{OUTPUT_KEEP_BYTES // 1048576}MB",
                 },
             }
         )
-        hosts.append(entry)
     return {
         "hosts": hosts,
-        "ro_allowlist": [p.raw for p in policy.ro_allowlist],
-        "hard_denies": [p.raw for p in policy.rw_denylist],
-        "secret_paths_denied_in_ro": list(policy.ro_deny_paths),
-        "note": "被拒命令不会建立连接；grant 只能由人在 TTY 里敲，我不能自批。",
+        "killlist": [p.raw for p in guard.kill_prefixes],
+        "unpinned": [a for a in sorted(creds) if not effective_pin(a, creds[a])[0]],
+        "note": "无权限控制：除 root 账号主机的 killlist（exec 带 force=true 可越过）外一律放行，真正的边界是远端账号自己的权限。被拦下的命令不会建立连接。",
     }
 
 
-def _tool_exec(host: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None) -> dict:
-    return execute(host, command, cwd, idle_timeout, max_duration)
+def _tool_exec(host: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None, force: bool = False) -> dict:
+    return execute(host, command, cwd, idle_timeout, max_duration, force)
+
+
+def _tool_pin_hostkey(host: str, trust: bool = False) -> dict:
+    """探测并（经确认后）写入主机指纹。全程不发送任何凭据。"""
+    cred = HOSTS.get().get(host)
+    if cred is None:
+        return {"host": host, "probed": False, "reason": "credential_missing", "hint": f"凭据文件里缺 {host}"}
+    try:
+        actual, key_type = probe_hostkey(cred.address, cred.port)
+    except Exception as exc:  # noqa: BLE001 - 网络/握手失败形态太杂，原样回给调用方
+        return {"host": host, "address": f"{cred.address}:{cred.port}", "probed": False, "reason": "probe_failed", "hint": f"{type(exc).__name__}: {exc}"}
+    expected, source = effective_pin(host, cred)
+    out = {
+        "host": host,
+        "address": f"{cred.address}:{cred.port}",
+        "probed": True,
+        "key_type": key_type,
+        "fingerprint": actual,
+        "pinned": expected or None,
+        "pin_source": source or None,
+        "match": bool(expected) and expected == actual,
+    }
+    if out["match"]:
+        out["hint"] = "指纹一致，exec 可直接用"
+        return out
+    if source == "credential":
+        out["writable"] = False
+        out["hint"] = (
+            f"凭据文件钉的 {expected} 与实际 {actual} 不符。我不写凭据文件：请你自行核对 {HOSTS_PATH} 的 hostKey "
+            "（可能是主机重装过，也可能真是中间人）"
+        )
+        return out
+    if not trust:
+        out["writable"] = True
+        out["hint"] = "把 pinned 与 fingerprint 两个值并报给用户，核对无误后带 trust=true 再调一次才会写入"
+        return out
+    save_pin(host, actual)
+    audit({"host": host, "command": f"<pin_hostkey {'replace' if expected else 'first'}>", "event": "hostkey_pinned", "previous": expected or None, "fingerprint": actual})
+    out.update({"pinned": actual, "pin_source": "hostkeys", "match": True, "hint": "已写入 hostkeys.json，exec 可用"})
+    return out
 
 
 def _tool_session_reset(host: str) -> dict:
@@ -815,15 +796,16 @@ def build_server():
     server_class = _import_highlevel_server()
     server = server_class("ssh-mcp")
 
-    @server.tool(name="list_hosts", description="列出可连主机及其权限约束、当前 effective_mode 与限额。不含任何密码。")
+    @server.tool(name="list_hosts", description="列出凭据文件里的主机、指纹固定状态、killlist 与限额。不含任何密码。")
     async def _list_hosts() -> dict:
         return _tool_list_hosts()
 
     @server.tool(
         name="exec",
         description=(
-            "在远端执行一条离散命令（不开交互 shell）。服务端按 policy.json 判定 ro/rw 并做命令级校验；"
-            "被拒时不建立连接，返回 reason 与下一步建议。cwd 由服务端按主机记忆，可用参数覆盖。"
+            "在远端执行一条离散命令（不开交互 shell）。服务端不做权限控制，命令原样交给远端 shell；"
+            "仅 root 账号主机会查一张自杀清单（killlist），命中时带 force=true 即可放行。"
+            "被拦下时不建立连接。cwd 由服务端按主机记忆，可用参数覆盖；max_duration 传多大就用多大。"
         ),
     )
     async def _exec(
@@ -832,12 +814,27 @@ def build_server():
         cwd: str | None = None,
         idle_timeout: float | None = None,
         max_duration: float | None = None,
+        force: bool = False,
     ) -> dict:
         import anyio
 
         return await anyio.to_thread.run_sync(
-            lambda: _tool_exec(host, command, cwd, idle_timeout, max_duration)
+            lambda: _tool_exec(host, command, cwd, idle_timeout, max_duration, force)
         )
+
+    @server.tool(
+        name="pin_hostkey",
+        description=(
+            "探测主机的实际 SSH 指纹（SHA256:base64）并在人工确认后写入本机 hostkeys.json。"
+            "用于 exec 返回 reason=host_key_unpinned / 指纹不匹配 的场合：先不带 trust 调一次拿到 fingerprint，"
+            "把它与已有 pinned 一并报给用户核对，确认无误后再带 trust=true 调一次落盘。"
+            "探测只做到密钥交换，不发送用户名与密码。凭据文件里已钉的 hostKey 由人自己改，这里覆盖不了。"
+        ),
+    )
+    async def _pin_hostkey(host: str, trust: bool = False) -> dict:
+        import anyio
+
+        return await anyio.to_thread.run_sync(lambda: _tool_pin_hostkey(host, trust))
 
     @server.tool(name="session_reset", description="丢弃某主机的 SSH 连接与 cwd 状态并重新握手。")
     async def _session_reset(host: str) -> dict:
@@ -853,7 +850,7 @@ def build_server():
         name="read_output",
         description=(
             "按 exec 返回的 output_id 回捞该命令的完整本机日志（exec 内联只给头尾两截）。"
-            "mode：head/tail 按行边界取，grep 返回带行号的命中，lines 取 [start,end] 行。"
+            "mode：head/tail 按行边界取，grep 返回带行号的命中（pattern 是子串匹配，不是正则），lines 取 [start,end] 行。"
             "典型用法：grep 'error' 拿到行号，再用 lines(start=行号-20, end=行号+40) 看上下文。"
         ),
     )
@@ -872,35 +869,30 @@ def build_server():
 
 
 # --------------------------------------------------------------------------------------
-# CLI：doctor / list / grant / revoke / serve
+# CLI：doctor / list / serve
 # --------------------------------------------------------------------------------------
 
 
 def cmd_doctor(_: argparse.Namespace) -> int:
-    print(f"policy : {POLICY_PATH}")
+    print(f"limits : {POLICY_PATH}")
     print(f"凭据   : {HOSTS_PATH}{'（不存在）' if not HOSTS_PATH.exists() else ''}")
-    print(f"grants : {GRANTS_PATH}{'（不存在）' if not GRANTS_PATH.exists() else ''}")
+    print(f"指纹   : {HOSTKEYS_PATH}{'（不存在）' if not HOSTKEYS_PATH.exists() else ''}")
     print(f"audit  : {AUDIT_PATH}")
     try:
-        policy = POLICY.get()
+        guard = GUARD.get()
     except Exception as exc:  # noqa: BLE001
         print(f"policy.json 解析失败：{exc}")
         return 1
-    print(f"\n可连主机白名单 {len(policy.hosts)} 台，ro 白名单 {len(policy.ro_allowlist)} 条，rw 黑名单 {len(policy.rw_denylist)} 条")
     creds = HOSTS.get()
-    missing = [a for a in policy.aliases if a not in creds]
-    if missing:
-        print(f"  缺凭据（policy 列了但凭据文件没有）：{', '.join(missing)}")
+    print(f"\n主机 {len(creds)} 台，killlist {len(guard.kill_prefixes)} 条（只对 username=root 的主机查）")
     for alias, cred in sorted(creds.items()):
+        pin, source = effective_pin(alias, cred)
         flags = []
-        if not cred.host_key:
-            flags.append("缺hostKey")
-        if alias not in policy.hosts:
-            flags.append("不在policy_hosts")
+        if not pin:
+            flags.append("未固定指纹(pin_hostkey)")
         if cred.auth == "password" and not cred.password:
             flags.append("password为空")
-        mode = long_lived_mode(cred)
-        print(f"  {alias:<8} {cred.username:<8} {mode.mode:<3}  {mode.reason}  {' '.join(flags)}")
+        print(f"  {alias:<8} {cred.username:<8} {'root' if cred.privileged else 'user':<5} pin={source or '-':<11} {' '.join(flags)}")
     try:
         AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
         probe = AUDIT_PATH.parent / ".write_probe"
@@ -921,7 +913,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         print(
             f"全文日志目录可写 ✓ {OUTPUT_ROOT}\n"
             f"  现存 {runs} 个 run / {used / 1048576:.1f} MB；轮转预算：{OUTPUT_KEEP_DAYS} 天内、"
-            f"≤{OUTPUT_KEEP_RUNS} 个 run、≤{OUTPUT_KEEP_BYTES // 1048576} MB，单文件上限取自 policy.max_output_bytes"
+            f"≤{OUTPUT_KEEP_RUNS} 个 run、≤{OUTPUT_KEEP_BYTES // 1048576} MB，单文件上限取自 defaults.max_output_bytes"
         )
     except OSError as exc:
         print(f"\noutput 目录不可写：{exc}（全文日志与审计同为必备件，会 fail-closed 拒绝执行）")
@@ -936,99 +928,11 @@ def cmd_doctor(_: argparse.Namespace) -> int:
 
 
 def cmd_list(_: argparse.Namespace) -> int:
-    data = _tool_list_hosts()
-    for h in data["hosts"]:
-        print(f"{h['alias']:<8} {h.get('effective_mode','?'):<4} grant={h.get('grant_count', 0)}  {h.get('mode_reason','') or h.get('purpose','')}")
-    return 0
-
-
-def human_confirm(title: str, body: str, timeout_s: int = 120) -> bool:
-    """弹 Windows 原生模态框，要人真的点「确定」。
-
-    为什么不用 stdin.isatty() 把关：实测在 Agent 的 Bash 工具里 isatty() 返回 True
-    （Git Bash 经 conpty 伪装成终端），那道校验拦不住 Agent 自批。对话框由子进程弹出，
-    Agent 没有桌面点击能力，超时就连子进程一起杀掉，等于自动取消。
-    """
-    if os.name != "nt":
-        return False
-    import subprocess
-
-    flags = 0x00000001 | 0x00000030 | 0x00001000  # MB_OKCANCEL | MB_ICONWARNING | MB_SYSTEMMODAL
-    code = (
-        "import ctypes,sys;r=ctypes.windll.user32.MessageBoxW(0,"
-        f"{body!r},{title!r},{flags});sys.exit(0 if r==1 else 1)"
-    )
-    try:
-        proc = subprocess.Popen([sys.executable, "-c", code])
-    except OSError as exc:
-        log(f"无法弹出确认框：{exc}")
-        return False
-    try:
-        return proc.wait(timeout=timeout_s) == 0
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        return False
-
-
-def cmd_grant(args: argparse.Namespace) -> int:
-    if not sys.stdin.isatty():
-        print("stdin 不是终端，拒绝签发。", file=sys.stderr)
-        return 2
-    policy = POLICY.get()
-    if args.alias not in policy.hosts:
-        print(f"{args.alias} 不在 policy.hosts 里，先加进 policy.json", file=sys.stderr)
-        return 1
-    creds = HOSTS.get().get(args.alias)
-    if creds is None:
-        print(f"{args.alias} 没有凭据条目", file=sys.stderr)
-        return 1
-    if not creds.rw_allowed:
-        print(f"{args.alias} 未设 rw_allowed，grant 解不开只读（能力位是第一层）", file=sys.stderr)
-        return 1
-    if args.scope == "cmd" and not args.cmd:
-        print("--scope cmd 必须给 --cmd", file=sys.stderr)
-        return 1
-    ttl = P.parse_duration(args.for_)
-    grant = P.Grant(
-        id=f"g-{uuid.uuid4().hex[:8]}",
-        alias=args.alias,
-        scope=args.scope,
-        command=args.cmd or "",
-        uses_left=args.uses,
-        expires_at=iso(now_utc() + timedelta(seconds=ttl)),
-        granted_via="pending",
-        why=args.why,
-    )
-    body = (
-        f"主机   {grant.alias}  ({creds.username}@{creds.address})\n"
-        f"root?  {creds.privileged}\n"
-        f"范围   {grant.scope}  {grant.command or '(该主机 rw 全开)'}\n"
-        f"时长   {ttl} 秒    次数   {'TTL 内不限' if grant.uses_left < 0 else grant.uses_left}\n"
-        f"理由   {grant.why or '(未填)'}\n\n"
-        "点「确定」签发该 rw 授权；「取消」或超时不写入。"
-    )
-    print(body)
-    if not human_confirm("ssh-mcp：确认签发 rw 授权？", body, timeout_s=CONFIRM_TIMEOUT):
-        print("未获得人工确认，已取消。", file=sys.stderr)
-        return 1
-    grant.granted_via = "user32.MessageBoxW"
-    store = GRANTS.get()
-    store.grants.append(grant)
-    save_grants(store)
-    audit({"host": grant.alias, "command": f"<grant {grant.scope} {grant.command}>", "decision": "grant", "reason": "issued", "matched_rule": grant.id, "broad_grant": None})
-    print(f"已签发 {grant.id}，有效期至 {grant.expires_at}。服务端下次 exec 自动读到，无需重启。")
-    return 0
-
-
-def cmd_revoke(args: argparse.Namespace) -> int:
-    store = GRANTS.get()
-    before = len(store.grants)
-    if args.all:
-        store.grants = [g for g in store.grants if g.alias != args.alias]
-    else:
-        store.grants = [g for g in store.grants if not (g.alias == args.alias and (args.id is None or g.id == args.id))]
-    save_grants(store)
-    print(f"撤销 {before - len(store.grants)} 条")
+    for h in _tool_list_hosts()["hosts"]:
+        print(
+            f"{h['alias']:<8} {'root' if h['privileged'] else 'user':<5} guard={h['guard']:<8} "
+            f"pin={h['pin_source'] or '未固定':<10} connected={h['connected']} cwd={h['cwd']}  {h['purpose']}"
+        )
     return 0
 
 
@@ -1048,20 +952,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = ap.add_subparsers(dest="sub")
     sub.add_parser("serve", help="以 stdio 跑 MCP 服务（默认）").set_defaults(func=cmd_serve)
     sub.add_parser("doctor", help="检查配置/凭据/依赖").set_defaults(func=cmd_doctor)
-    sub.add_parser("list", help="列出主机与当前 mode").set_defaults(func=cmd_list)
-    g = sub.add_parser("grant", help="签发 rw 授权（必须 TTY）")
-    g.add_argument("alias")
-    g.add_argument("--scope", choices=["host", "cmd"], default="host")
-    g.add_argument("--cmd", default="", help="cmd scope 的前缀，如 'apt install nginx'")
-    g.add_argument("--for", dest="for_", default="30m")
-    g.add_argument("--uses", type=int, default=1, help="可消费次数，-1 为 TTL 内不限次")
-    g.add_argument("--why", default="")
-    g.set_defaults(func=cmd_grant)
-    r = sub.add_parser("revoke", help="撤销授权")
-    r.add_argument("alias")
-    r.add_argument("--id", default=None)
-    r.add_argument("--all", action="store_true")
-    r.set_defaults(func=cmd_revoke)
+    sub.add_parser("list", help="列出主机与指纹固定状态").set_defaults(func=cmd_list)
     return ap
 
 

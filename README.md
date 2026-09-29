@@ -4,49 +4,64 @@
 
 已知未修的问题与边界集中在 **`ISSUES.md`**（追加式，供未参与原会话的 Agent 接手）；排查出缺陷时先往那里记一条，再来改代码。
 
-设计取舍都写在本文件的「权限模型速查」和「已知边界」两节里。早期那份 `ssh-mcp-SPEC.md` 不在本仓库内，条目编号（§5.1、§8、§11）仍沿用它，读到编号时以本文件为准。
+## 2026-09-29：权限控制已解除
+
+原来那套「ro 白名单 / rw 黑名单 / 人工 grant」三层判定整条移除。理由（用户判定）：命令过滤挡不住蓄意绕行的 AI，却给每一条正常命令都加了一轮往返和一个假红点 —— 效率代价全额支付，安全收益接近零。
+
+服务现在只做三件事：**保持 SSH 连接**、**返回日志**、**注入密码**。
+
+唯一保留的拦截是一张 25 条的**自杀清单**（`policy.json` 的 `killlist`），且**只对 `username == "root"` 的主机生效**，命中后 `exec(force=true)` 一步就过。它的定位是「挡手滑的 AI」，不是「挡蓄意的 AI」：毁盘、把 ssh 关掉、把自己锁在门外这三类形态。
+
+`ssh_policy.py`(566 行) → `ssh_guard.py`(308 行)。删掉的 300 行全是反绕过机制（包装器剥壳、`sh -c` 递归复检、curl/wget 专项、解释器特判）。`grants.json`、CLI `grant`/`revoke`、Windows 原生确认框一并移除。
 
 ## 它解决什么
 
 | 之前（plink -batch） | 现在 |
 |---|---|
 | 每条命令重新握手认证 | 连接池 + keepalive，复用同一 transport |
-| Agent 不知道该拦什么，靠试 | `list_hosts` 直接把白名单/黑名单/当前 mode 回给 Agent |
 | 密码出现在本机进程命令行（`-pw`） | 密码只在服务进程内存里 |
-| 没有权限分层 | ro 白名单 / rw 黑名单 / 人工 grant 三层 |
-| 无留痕 | 每条命令（含被拒）落 JSONL 审计 |
+| 输出大到看不下，Agent 只能猜 | 全文落本机 `output/`，`read_output` 按行号回捞 |
+| 无留痕 | 每条命令落 JSONL 审计，force 越过清单也记一笔 |
+| 新主机要在两个文件各点一次头 | 可连 = 凭据文件里有这条（`policy.json` 不再列主机） |
 
 ## 装
 
 ```powershell
-# 自检（配置、凭据、依赖、审计目录可写）
+# 自检（配置、凭据、指纹、依赖、审计与日志目录可写）
 uv run --quiet E:\Ilovestudy\MyWork\mcp\ssh-mcp\ssh_mcp.py doctor
 ```
 
-离线策略测试（裸 python 即可，不需要 paramiko；36 例，覆盖 ro/rw 判定与黑名单绕过向量）：
+清单判定的离线用例（裸 python 即可，不需要 paramiko；21 例，含等价写法与「设计上不再防」的形态）：
 
 ```powershell
-python test_ssh_policy.py
+python test_ssh_guard.py
 ```
 
-全文日志与回捞的离线用例（同样裸 python，不碰网络）：
+全文日志与回捞的离线用例（同样裸 python，不碰网络；24 例）：
 
 ```powershell
 python test_output_store.py
 ```
 
-连接拒绝与授权路径的用例要真导入 paramiko，必须用 `uv run`，且**不能写成 `uv run python xxx.py`** —— 那种写法不读文件头的 PEP 723 deps，会拿到本机 site-packages 里缺 `cryptography` 的 paramiko 而报 ModuleNotFoundError：
+前置检查、指纹固定与执行接线的用例要真导入 paramiko，必须用 `uv run`，且**不能写成 `uv run python xxx.py`** —— 那种写法不读文件头的 PEP 723 deps，会拿到本机 site-packages 里缺 `cryptography` 的 paramiko 而报 ModuleNotFoundError：
 
 ```powershell
 uv run --quiet test_connect_refusals.py
 ```
 
+stdio 冒烟（拉起服务、走 initialize / tools/list / list_hosts，并检查返回值不含密钥字段）：
+
+```powershell
+uv run --quiet smoke_stdio.py
+```
+
 ## 配
 
-1. `copy ssh_mcp_hosts.example.json ssh_mcp_hosts.json`，填真实凭据。**这个文件我不读不写**，`hostKey` 缺失会直接拒连。
-   可用字段：`address` `port` `username` `auth`（`password`/`key`）`password` `key_path` `hostKey` `rw_allowed` `purpose`。
+1. `copy ssh_mcp_hosts.example.json ssh_mcp_hosts.json`，填真实凭据。**这个文件我不读不写**，是红线。
+   可用字段：`address` `port` `username` `auth`（`password`/`key`）`password` `key_path` `hostKey` `purpose`。
+   旧字段 `rw_allowed` 已从模型里删掉；凭据文件里残留它会被静默忽略，不用你去清理（有用例钉着这个兼容行为）。
    `auth: "key"` 时 `key_path` 可省略，缺省按 `~/.ssh/{id_ed25519,id_rsa,id_ecdsa,id_dsa}` 顺序找。**带 passphrase 的文件私钥不支持**，此时改为问 ssh-agent 并取它的第一把 key（只取一把：逐把试认证会连着打远端的失败次数）。Windows 的 `ssh-agent` 服务默认是 Stopped/Disabled，要先 `Set-Service ssh-agent -StartupType Manual` 起服务再 `ssh-add`。
-2. `policy.json` 的 `hosts` 键集合 = 可连白名单。凭据里有但这里没列的主机连不上（两处都要点头）。
+2. `policy.json` 现在只剩两样：`defaults`（超时与输出上限）和 `killlist`。
 3. Qoder 里加 MCP（或手工写进 MCP 配置）：
 
 ```json
@@ -59,33 +74,44 @@ uv run --quiet test_connect_refusals.py
 
 加完 `/mcp reload`。
 
-## 权限模型速查
+## 指纹与 pin_hostkey
 
-| 账号 | 无 `rw_allowed` | `rw_allowed: true` |
-|---|---|---|
-| 非特权 | 永远 ro | 长期 rw（黑名单仍生效） |
-| `root` | 永远 ro | 默认 ro，需未过期 grant |
+`hostKey` 是**唯一还在拦你的东西**，而它拦的不是 AI，是中间人 —— 探测阶段不发送用户名与密码，所以密码永远不会交给一台没验证过的机器。未钉指纹的主机一律拒连。
 
-`privileged` 由 `username == "root"` 推导，不可手工覆盖。`sudo` 在 rw 黑名单里，MCP 这条路上不会自动提权。
+新主机不必再去手抄指纹了：`pin_hostkey(host)` 探测实际指纹（只做到密钥交换），落盘要显式 `trust=true`，写进本机 `hostkeys.json`。约定流程是 **探测 → 把 `pinned` 与 `fingerprint` 两个值并报给用户 → 用户核对 → 再带 `trust=true` 调用**。
 
-**grant 只对 root 账号有意义。** `resolve_mode` 在长期 rw 时直接返回（ssh_mcp.py:204），不会去读 grant —— 所以给「非 root + `rw_allowed: true`」的主机（比如 100）签条子是**空转**：命令照样放行，但审计里 `grant_id=null`、`uses_left` 也不减。真要验解锁路径只能靠 root 账号主机，`test_connect_refusals.py` 的 `GrantUnlock` 用假 `run_command` 覆盖了这条（含 cmd scope 的消费计数）。另外 cmd scope 才计次数，host scope 只靠 TTL 到期。
+两条边界：
+- 凭据文件里已钉过 `hostKey` 且与实际不符 → 工具**拒绝覆盖**（返回 `writable: false`），那必须是主机重装或真中间人，由人自己改凭据文件。
+- `hostkeys.json` 只给凭据文件没钉的主机兜底；凭据里钉过就以凭据为准（`list_hosts` 的 `pin_source` 会告诉你是哪边）。
 
-## 黑名单怎么比（Agent 必读）
+## 拦截边界（Agent 必读）
 
-判定发生在**发给远端 shell 之前**，所以「看着不像但等价」的写法必须自己归一，否则规则形同虚设。当前做四件事：
+`exec(host, command, cwd?, idle_timeout?, max_duration?, force=false)` 对任何命令一律放行，除了 root 主机上的这三类形态：
 
-- **路径归一**：`//etc`、`/etc/`、`/./`、`/*` 都折叠回规范形态，所以 `rm -rf /*` 命中 `rm -rf /` 那条。远端 shell 的 `*` 展平发生在放行之后，指望不上。
+| 类别 | 条目 |
+|---|---|
+| 毁盘 | `rm` 递归删一级目录（`/`、`/etc`、`/var`…）、`mkfs*`、`wipefs`、`dd of=/dev/`、`fdisk /dev/`、`parted` |
+| 断电 | `shutdown` `reboot` `halt` `poweroff` `init 0/6` |
+| 锁死自己 | `systemctl stop/disable sshd|ssh`、`systemctl stop firewalld`、`iptables -F/-X`、`nft flush`、`ufw disable`、`userdel` `groupdel` `passwd`、覆写 `authorized_keys`/`sshd_config`/`sudoers`/`fstab`/`shadow`/`passwd` |
+
+判定发生在**发给远端 shell 之前**，所以「看着不像但等价」的写法要自己归一，做三件事：
+
+- **路径归一**：`//`、`/./`、尾部斜杠、`/*` 折叠回规范形态；`rm` 那条按归一后的**路径深度 ≤1** 判，所以 `rm -rf /*` 和 `rm -rf /` 同一命中，而 `rm -rf /tmp/build` 不受影响。
 - **权限位等价**：数字 token 按整数值比，`chmod 0777 /` 等于 `chmod 777 /`。
-- **引号外的 `;` `|` `&` 补空格再切**：`df -h;rm -rf /var` 是两条命令，早期版本会把 `;` 粘进前一个 token、只看见 `df` 就放行 —— ro 模式也会因此失守。`2>&1` / `&>` 里的 `&` 不算分隔符。
-- **包装器剥壳**：`nohup`/`env`/`nice`/`time`/`timeout`/`stdbuf`/`unshare`/`setarch`/`watch`/`strace`/`xargs`/`busybox` 这类前缀词后面逐个复检；`sh`/`bash`/`dash`/`ksh`/`zsh` 的 `-c` 字符串整条重跑判定。**只在剥完仍被黑名单拦住时才收紧**，所以 `nice -n 10 make -j8`、`env FOO=bar python app.py` 照常放行。
+- **引号外的 `;` `|` `&` 补空格再切段**：`uptime;rm -rf /` 是两条命令，不分段就只能看见 `uptime`。`2>&1` / `&>` 里的 `&` 不算分隔符。
+
+命中时返回 `{blocked: true, reason: "killlisted", rule, hint}`，hint 就一句「带 force=true 重发」。执行过的 force 命令在审计里记 `rule: "forced"`。
+
+**设计上不再防的形态**（钉在 `test_ssh_guard.py` 的 `DeliberatelyNotCaught` 里，别当成已防住）：`nohup rm -rf /`、`env FOO=1 reboot`、`timeout 5 mkfs /dev/sda`、`bash -c 'rm -rf /'`、`python -c "os.system('reboot')"`、`$(echo rm) -rf /`、`R=/; rm -rf $R`、`vi /etc/ssh/sshd_config`、`sed -i ... /etc/sudoers`。真边界是远端账号权限。
 
 ## 工具
 
-- `list_hosts()` —— 主机、约束、`effective_mode`、grant 到期时间、限额。不含密码。
-- `exec(host, command, cwd?, idle_timeout?, max_duration?)` —— 离散命令。被拒不建立连接，返回 `reason` + 下一步建议。
+- `list_hosts()` —— 主机、`pin_source`、是否查清单、限额。不含密码。
+- `exec(host, command, cwd?, idle_timeout?, max_duration?, force?)` —— 离散命令。被拦下时不建立连接。
+- `pin_hostkey(host, trust?)` —— 探测主机指纹；`trust=true` 才写 `hostkeys.json`。
 - `session_reset(host)` —— 丢连接与 cwd 重来。
-- `audit_tail(host?, limit?)` —— 回看最近审计（含被拒）。
-- `read_output(output_id, stream?, mode?, start?, end?, pattern?, limit?)` —— 按 `exec` 返回的 `output_id` 回捞全文。`mode`：`head`/`tail` 按行边界取，`grep` 返回**带行号**的命中，`lines` 取 `[start,end]` 行；单次上限 16KB。
+- `audit_tail(host?, limit?)` —— 回看最近审计（含被拦的）。
+- `read_output(output_id, stream?, mode?, start?, end?, pattern?, limit?)` —— 按 `exec` 返回的 `output_id` 回捞全文。`mode`：`head`/`tail` 按行边界取，`grep` 返回**带行号**的命中（`pattern` 是**子串**匹配，不是正则），`lines` 取 `[start,end]` 行；单次上限 16KB。
 
 **没有** 交互 shell / PTY / 按键透传，这是故意的：netcatty 那套长会话死在 `terminal_execute` 全部挂起上。
 
@@ -93,40 +119,37 @@ uv run --quiet test_connect_refusals.py
 
 ## 全文日志与轮转
 
-落**本机**不落远端：ro 主机上把输出写到远端文件本身就是越权写，rw 主机也没必要堆别人的调试垃圾。
+落**本机**不落远端：rw 主机也没必要在人家盘上堆调试垃圾，写远端文件本身还可能踩到只读挂载。
 
 - 单文件上限取 `policy.defaults.max_output_bytes`（现 8MB），超出即停止写入并在 `output.<stream>.overflow` 里标记
 - 轮转预算：`7 天` 且 `≤200 个 run` 且 `≤500MB`，任一命中就删整组；每次 `exec` 前顺手清一次（无定时器、无后台线程）
 - 以上预算可用环境变量覆盖：`SSHMCP_OUTPUT`（目录）、`SSHMCP_OUTPUT_KEEP_RUNS`、`SSHMCP_OUTPUT_KEEP_BYTES`、`SSHMCP_OUTPUT_KEEP_DAYS`
 - **全文是原文落盘，不做脱敏。** 构建日志里可能出现 `--password=`、`Authorization:`、带 token 的镜像源 URL。`output/` 已进 `.gitignore`，但如果你在本机跑了文件同步/分享工具，别让它覆盖这个目录 —— 这是这套设计换来的代价，换掉的收益是「Agent 能拿到结论而不用吞 80KB 日志」。
-- 日志目录写不了就 **fail-closed 拒绝执行**（与审计同级），不会静默降级成「只有内存里那份」。
-
-## CLI（人在终端敲）
-
-```powershell
-uv run --quiet ssh_mcp.py list                       # 看当前 mode 与 grant
-uv run --quiet ssh_mcp.py grant 100 --scope host --for 30m --why "装 nginx"
-uv run --quiet ssh_mcp.py grant 100 --scope cmd --cmd "apt install nginx" --uses 1
-uv run --quiet ssh_mcp.py revoke 100 --all
-```
-
-`grant` 会弹一个 Windows 原生模态框，列出主机/scope/时长/理由，**必须有人点「确定」**；取消或 120s 超时都不落盘。
-（别指望 `stdin.isatty()`：实测 Agent 的 Bash 里它返回 True，Git Bash 经 conpty 伪装成终端，那道校验拦不住自批。）
+- 日志目录与审计目录写不了就**拒绝执行**（fail closed），不会静默降级成「只有内存里那份」。
 
 ## 超时
 
 - `idle_timeout_s`（默认 30）：**无新输出**才触发。下载有进度条会不断重置，不会被误杀。
-- `max_duration_s`（默认 300）：硬兜底。
+- `max_duration_s`（默认 300）：缺省值。**调用方传的 `max_duration` 不再被夹制**，传多大用多大 —— 长构建（`cmake`、`pip install torch`）靠这个跑完，M2 的 `detach` 因此不再紧迫。
+- 两种超时各归各的：`wait=min(idle,剩余时长)`，谁定的这一轮就报谁，所以传 `max_duration=1` 会得到 `timed_out: "duration"` 而不是 `idle`（真机实测修过一次误报）。
 - 超时只关 channel 不关连接，后续命令照常。
 - 超时被打断时，**已经收到的输出仍在 `output/` 里**，可以 `read_output` 捞回来看跑到哪一步了。
-- 静默长任务（编译、`tail -f`）M1 只能撞 max_duration；`detach` + `job_log` 在 M2。
+
+## CLI（人在终端敲）
+
+```powershell
+uv run --quiet ssh_mcp.py doctor    # 配置/凭据/指纹/依赖/两个目录可写
+uv run --quiet ssh_mcp.py list      # 主机、guard 是否生效、pin 来源、当前 cwd
+```
+
+`grant`/`revoke` 与 Windows 原生确认框随权限控制一起删掉了。（留着也没意义：实测 Agent 的 Bash 里 `stdin.isatty()` 返回 True，Git Bash 经 conpty 伪装成终端，那道校验本来就拦不住自批。）
 
 ## 已知边界
 
-1. `policy.json` 是**护栏不是沙箱**。真边界是远端账号权限 —— 长期 rw 的主机请用非特权、无 sudo 账号。
-2. `grants.json` 与凭据同属当前用户，Agent 用文件工具理论上能直接改它。原生确认框挡的是「Agent 自己跑 grant」这条正路，不挡「蓄意绕过」。要硬边界就得把 grants.json 放到另一个 Windows 用户下，或全部改用非 root 账号。
-3. cmd grant 对包管理器类命令（`apt`/`pip`/`npm`/`docker`/`systemctl`）≈放行任意执行，这类命中会打 `broad_grant` 标记，只标注不改行为。
-4. 引号内的 `>` `<` 已通过掩码排除；但 `grep a>b`（未加引号）仍会被判为重定向 —— 宁可错杀。
+1. **服务端不再做任何权限判断**（除 root 主机的 killlist）。同一台机器上「读一眼」和「`rm -rf`」的代价完全相同，唯一的地板是远端账号权限。`66` 原先靠 `rw_allowed: false` 被锁成只读，现在没有那层了。
+2. `hostkeys.json` 与凭据同属当前用户，Agent 用文件工具理论上能直接改它。`pin_hostkey` 的两步（探测 → `trust=true`）靠的是**约定和向用户回报**，不是强制。要硬边界就得把这个文件放到另一个 Windows 用户下，或全部改用非 root 账号。
+3. 静态分析有地板，见上面「设计上不再防的形态」。包装器与解释器的反绕过机制是主动删掉的，不是漏了。
+4. 引号内的 `>` `<` 已通过掩码排除；但 `grep a>b`（未加引号）里的 `>` 仍会被当成重定向目标去看一眼 —— 只有撞上那张敏感文件名单才拦，日常不会误杀。
 5. 密码解密后常驻服务进程内存。长期方案是全量转私钥认证。
-6. **静态分析有地板**：`$(echo rm) -rf /`、`R=/; rm -rf $R`、`python -c "os.system(...)"` / `perl -e` / `awk BEGIN{system()}` 的内层语言、`(reboot)` 这类子 shell 分组，都是「换个写法这条命令里就看不到危险段」的形态，拦不住。`test_rw_blacklist_known_gaps` 把每一形态钉在用例里，别把它们当成已防住 —— 要封只能靠远端账号权限（见第 1 条）。
-7. 少数只读用法会被错杀：裸 `mount` 只是打印挂载表，但它和 `umount` 都在黑名单里，改用 `df` / `lsblk`。
+6. root 主机 + `force=true` 的链路只有离线用例（假 `run_command`）覆盖：唯一配置的 root 主机 `admin`（pve2）在凭据文件里没条目，而真机测试只允许在 100 上跑。要补的是凭据，不是代码。
+7. 原先被错杀的只读用法现在都能跑了：裸 `mount`（只是打印挂载表）、`fdisk -l`、`docker system prune -af`、`kubectl delete`、`crontab -r`、`history -c`、`sudo`。
