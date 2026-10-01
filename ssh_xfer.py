@@ -104,6 +104,9 @@ def push(sftp, local: str, part: str, *, chunk: int = DEFAULT_CHUNK, deadline: f
 
     have = _remote_size(sftp, part)
     _, base = resume_from(have, chunk)
+    if base > size:
+        # part 比新源还大：源文件被重新生成过，旧前缀已不对应任何有效状态，只能从头来
+        base = 0
     if have > base:
         _truncate_remote(sftp, part, base)
 
@@ -132,6 +135,10 @@ def pull(sftp, remote: str, part: str, *, chunk: int = DEFAULT_CHUNK, deadline: 
 
     have = _local_size(part)
     _, base = resume_from(have, chunk)
+    if base > size:
+        # 远端文件被换小/重新生成过：本机这份旧 part 的前缀已经不对应任何有效状态
+        base = 0
+        have = 0
     if have > base:
         with open(part, "r+b") as fh:
             fh.truncate(base)

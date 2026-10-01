@@ -79,6 +79,10 @@
 
 另外三条设计约束（都有实测支撑，写在 README）：暂存不能放 `/tmp`（100 的 `/tmp` 是 tmpfs 15.2G，4GB 上限会吃内存）；传输目标必须走 `ssh_guard.check_write_target`（否则 SFTP 是清单的绕过口，缺口已实测）；远端 md5 用 `md5sum` 而不是读回来算（0.12s vs 18s / 200MB）。
 
+4. **提交后又抓到两个命名/作废缺陷**（已修，回归用例钉着）：
+   - `restart=true` 在 `elevate` 路径上是**空操作** —— 它删的是非提权那条 part 名（`<目标>.sshmcp-part`），而提权走 `~/.sshmcp-xfer/<名>.sshmcp-part`，于是 3MB 的旧暂存被当"已传部分"静默复用。修法是让提权路径也调 `X.part_path_for()`（命名只有一处来源），并把删除挪到 part 解析之后。真机分别验了两条分支：默认续传 `resumed_from=7340096` 保留已传片；带 restart `resumed_from=0` 从头传，两者最终 md5 都等于原文。
+   - part 比新源文件还大（源被重新生成过）时，旧前缀不对应任何有效状态却会被当已传部分 → `push`/`pull` 现在遇到 `base > size` 一律作废从头传。用例：`test_stale_part_larger_than_source_is_discarded`、`test_stale_local_part_larger_than_remote_is_discarded`。
+
 ## 2026-09-29 · 传输没有跨调用取消，也没有目录批量（P2，按用户决定不做）
 
 - **症状**：中断的传输只能由"用同一组参数再调一次"续传，无法取消别人发起的那次；目录要靠调用方自己 `exec tar czf` 再传归档。

@@ -742,6 +742,32 @@ class TransferWiring(unittest.TestCase):
         self.assertTrue(rec, "成功的传输要进审计")
         self.assertEqual(rec[0]["md5"], md5)  # audit_tail 是倒序，[0] 才是本次
 
+    def test_restart_clears_the_staging_part_for_elevated_put(self):
+        """elevate 的 part 名与非提权不同：restart 必须删解析后的那个，否则旧暂存被静默复用。"""
+        write_hosts({"100": dict(self.CRED)})
+        staging = f"/home/qy/{M.STAGING_DIRNAME}/t.txt{M.X.PART_SUFFIX}"
+        stub = SftpStub({staging: bytearray(b"\xff" * (3 * 1048576))})
+
+        seen = []
+
+        def ok_run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False):
+            seen.append((command, elevate))
+            spill.close()
+            return M.RunResult(exit_code=0, stdout="", stderr="", truncated=False, timed_out=None,
+                               output_id=spill.run_id, stats=spill.stats())
+
+        with mock.patch.object(M, "_sftp_of", return_value=stub), mock.patch.object(M, "run_command", ok_run), \
+             mock.patch.object(M, "_remote_md5", return_value=hashlib.md5(self.src.read_bytes()).hexdigest()):
+            r = M._tool_put_file("100", str(self.src), "/root/t.txt", elevate=True, restart=True, overwrite=True)
+        self.assertTrue(r["verified"], str(r))
+        self.assertEqual(r["resumed_from"], 0, "旧暂存不能被当成已传部分")
+        # 旧暂存是 3MB 的 0xff，restart 后 part 里必须只剩本次源文件那么多个字节
+        self.assertEqual(len(stub.files[staging]), self.src.stat().st_size, "3MB 的旧前缀没被丢掉")
+        self.assertEqual(bytes(stub.files[staging]), self.src.read_bytes())
+        self.assertTrue(seen and seen[0][1] is True, "收尾的 install 要提权执行")
+        self.assertIn(staging, seen[0][0])
+        self.assertIn("/root/t.txt", seen[0][0])
+
     def test_get_lands_in_configured_dir_and_verifies(self):
         write_hosts({"100": dict(self.CRED)})
         payload = "远端内容".encode("utf-8")

@@ -174,6 +174,25 @@ class PushPull(unittest.TestCase):
         X.push(self.sftp, str(self.local), "/r/part", chunk=CH)
         self.assertTrue(seen.get("pipelined"), "不开 pipelined 实测慢一半（5.2 vs 10.1 MB/s）")
 
+    def test_stale_part_larger_than_source_is_discarded(self):
+        """源文件被重新生成过（变小了）：旧 part 前缀已不对应任何有效状态，必须从头来，
+        不能把"比整个文件还长"的旧字节当已传部分。"""
+        part = "/r/stale.part"
+        self.sftp.files[part] = bytearray(b"\xff" * (30 * CH))
+        small = self.tmp / "small.bin"
+        small.write_bytes(b"brand new" * 100)
+        tr = X.push(self.sftp, str(small), part, chunk=CH)
+        self.assertEqual(tr.resumed_from, 0)
+        self.assertEqual(bytes(self.sftp.files[part]), small.read_bytes())
+
+    def test_stale_local_part_larger_than_remote_is_discarded(self):
+        self.sftp.files["/r/small.bin"] = bytearray(b"tiny" * 10)
+        part = self.tmp / "dst.sshmcp-part"
+        part.write_bytes(b"\xff" * (9 * CH))
+        tr = X.pull(self.sftp, "/r/small.bin", str(part), chunk=CH)
+        self.assertEqual(tr.resumed_from, 0)
+        self.assertEqual(part.read_bytes(), b"tiny" * 10)
+
     def test_every_chunk_is_flushed(self):
         """逐片 flush 是续传状态确定的前提：异步入队的写在异常后会继续落盘，part 字节数会漂移。"""
         X.push(self.sftp, str(self.local), "/r/part", chunk=CH)

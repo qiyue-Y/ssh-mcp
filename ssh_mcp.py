@@ -900,8 +900,6 @@ def _tool_put_file(host: str, local: str, remote: str, overwrite: bool = False, 
     sftp = None
     try:
         sftp = _sftp_of(host, cred, pin)
-        if restart:
-            _drop_remote(sftp, X.part_path_for(remote))
         existing = _remote_stat_size(sftp, remote)
         if existing is not None and not overwrite:
             out["hint"] = f"远端已存在 {remote}（{existing} 字节）。确认要覆盖就带 overwrite=true"
@@ -912,9 +910,13 @@ def _tool_put_file(host: str, local: str, remote: str, overwrite: bool = False, 
         if elevate:
             stage = f"{_remote_home(sftp)}/{STAGING_DIRNAME}"
             _ensure_remote_dir(sftp, stage)
-            part = f"{stage}/{Path(remote).name}.part"
+            part = X.part_path_for(f"{stage}/{Path(remote).name}")
         else:
             part = X.part_path_for(remote)
+        # restart 必须删"解析之后"的那个 part：提权路径的名字与非提权不同，
+        # 早先按非提权名删是空操作，旧暂存会被静默复用
+        if restart:
+            _drop_remote(sftp, part)
 
         out["part"] = part
         have = _remote_stat_size(sftp, part) or 0
@@ -989,7 +991,7 @@ def _tool_get_file(host: str, remote: str, local: str = "", overwrite: bool = Fa
         if elevate:
             stage = f"{_remote_home(sftp)}/{STAGING_DIRNAME}"
             _ensure_remote_dir(sftp, stage)
-            src = f"{stage}/{Path(remote).name}.in.part"
+            src = X.part_path_for(f"{stage}/{Path(remote).name}.in")
             dump = f"cat -- {shlex.quote(remote)} > {shlex.quote(src)}"
             res = run_command(cred, pin, dump, "~", guard.idle_timeout_s, guard.xfer_timeout_s,
                               _throw_spill(guard), elevate=True)
