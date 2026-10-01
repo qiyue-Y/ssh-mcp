@@ -2,11 +2,15 @@
   "defaults": {
     "idle_timeout_s": 30,
     "max_duration_s": 300,
-    "max_output_bytes": 8388608
+    "max_output_bytes": 8388608,
+    "xfer_dir": "D:\\temporaryfile\\download",
+    "xfer_timeout_s": 1800,
+    "xfer_chunk_bytes": 1048576,
+    "max_transfer_bytes": 4294967296
   },
-
-  "guarded_hosts": ["66"],
-
+  "guarded_hosts": [
+    "66"
+  ],
   "killlist": [
     "mkfs*",
     "wipefs",

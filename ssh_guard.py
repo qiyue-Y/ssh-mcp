@@ -61,6 +61,11 @@ class GuardConfig:
     max_output_bytes: int = 204800
     kill_prefixes: list[Prefix] = field(default_factory=list)
     guarded_hosts: frozenset[str] = frozenset()
+    # 传输预算：上限 4GB，单次调用默认给 30 分钟（实测 10 MB/s 下 4GB 约 7 分钟，留足往返抖动）
+    xfer_timeout_s: float = 1800.0
+    max_transfer_bytes: int = 4 * 1024**3
+    xfer_chunk_bytes: int = 1024 * 1024
+    xfer_dir: str = ""
 
 
 class GuardSyntaxError(ValueError):
@@ -277,9 +282,28 @@ def load_guard(data: dict | None) -> GuardConfig:
         idle_timeout_s=float(defaults.get("idle_timeout_s", 30)),
         max_duration_s=float(defaults.get("max_duration_s", 300)),
         max_output_bytes=int(defaults.get("max_output_bytes", 204800)),
+        xfer_timeout_s=float(defaults.get("xfer_timeout_s", 1800)),
+        max_transfer_bytes=int(defaults.get("max_transfer_bytes", 4 * 1024**3)),
+        xfer_chunk_bytes=int(defaults.get("xfer_chunk_bytes", 1024 * 1024)),
+        xfer_dir=str(defaults.get("xfer_dir") or ""),
         kill_prefixes=parse_prefixes((data or {}).get("killlist") or []),
         guarded_hosts=frozenset((data or {}).get("guarded_hosts") or []),
     )
+
+
+def check_write_target(path: str) -> Hit | None:
+    """传输落点检查：写这些文件 = 下次登录不上或提权面失控。
+
+    和 exec 的重定向/tee 检查共用同一份 SENSITIVE_WRITE_TARGETS。SFTP 的写不经过
+    命令串，100 上实测「exec 追加 authorized_keys 被拦、SFTP 打开同一路径畅通」，
+    所以这一道必须由传输通道自己走，否则传输就是清单的绕过口。
+    """
+    target = _collapse_path(path)
+    hit = next((s for s in SENSITIVE_WRITE_TARGETS if s in target), None)
+    if hit is None:
+        return None
+    return Hit(rule=f"deny:写入敏感文件 {target}", segment=[])
+
 
 
 def applies(cred_privileged: bool, alias: str, config: GuardConfig) -> bool:

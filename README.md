@@ -144,11 +144,89 @@ sudo -S -p '' --user root -- sh -c '<原命令，含 cd 前缀>'
 - `list_hosts()` —— 主机、`pin_source`、是否查清单、限额。不含密码。
 - `exec(host, command, cwd?, idle_timeout?, max_duration?, force?, elevate?)` —— 离散命令。被拦下时不建立连接。`elevate=true` 以 root 跑这一条（凭据里得先给这台开 `elevate`）。
 - `pin_hostkey(host, trust?)` —— 探测主机指纹；`trust=true` 才写 `hostkeys.json`。
+- `put_file(host, local, remote, overwrite?, force?, elevate?, restart?, mode?)` —— 本机 → 远端，分片续传 + md5。
+- `get_file(host, remote, local?, overwrite?, elevate?, restart?)` —— 远端 → 本机，落 `defaults.xfer_dir`。
+- `xfer_stat(host, remote)` —— 远端 size/mode/uid/mtime，传前判断该不该传（省一次 `ls -l` 文本解析）。
 - `session_reset(host)` —— 丢连接与 cwd 重来。
 - `audit_tail(host?, limit?)` —— 回看最近审计（含被拦的）。
 - `read_output(output_id, stream?, mode?, start?, end?, pattern?, limit?)` —— 按 `exec` 返回的 `output_id` 回捞全文。`mode`：`head`/`tail` 按行边界取，`grep` 返回**带行号**的命中（`pattern` 是**子串**匹配，不是正则），`lines` 取 `[start,end]` 行；单次上限 16KB。
 
 **没有** 交互 shell / PTY / 按键透传，这是故意的：netcatty 那套长会话死在 `terminal_execute` 全部挂起上。
+
+## 文件传输
+
+走 SFTP。选型是被实测逼出来的，不是试出来的：
+
+| 路线 | 结论 |
+|---|---|
+| scp | **出局** —— paramiko 5.0 已删 `SCPClient`（实测 `hasattr(paramiko, "SCPClient")` 为 False），要走得引第三方依赖 |
+| `base64` 过 `exec` | 只解决上传；下载方向实测取 100KB 就 `truncated=true`，50MB 膨胀到 6990 万字节压根回不来 |
+| `cat > file` 喂 channel stdin（不依赖 sftp-server） | 实测 5 MB/s，比 SFTP 慢 76%，下载方向同样无解 —— **不做这第二条路**，远端没 sftp-server 就明确报错 |
+| SFTP | 100 上实测握手 13ms，整文件 `put`/`get` 双向 md5 一致 |
+
+### 分片续传
+
+`put`/`get` 没有 offset 参数（实测签名 `put(localpath, remotepath, callback, confirm)`），续传只能自己用 `sftp.file()` + `seek` 拼。**关键写法实测**（同一个 24MB）：
+
+| 写法 | 吞吐 |
+|---|---|
+| 整块一次 `write` | 2.8 MB/s |
+| 8MB 分片 | 4.0 MB/s |
+| 非 pipelined 1MB 分片 | 5.2 MB/s |
+| pipelined、只在收尾 flush | 5.9 MB/s |
+| **pipelined + 每片 flush** | **10.1 MB/s**（与 `sftp.put` 持平） |
+
+每片 flush 不是代价，是**正确性要求**：pipelined 写是异步入队的，中途抛异常或提前关通道时，已入队的写还会继续落服务端。真机抓到过这一幕 —— 超时中断时 part 是 12MB，下次再看成了 60MB，续传点建立在漂移的状态上。逐片 flush 之后 part 的字节数才是确定的。
+
+续传语义按**片**而不是按字节：part 路径由目标固定（`<目标>.sshmcp-part`，不带随机后缀，这是「下次能接着传」的前提）；恢复时把末尾不足一片的部分截掉，从该片整片重写；片内不连续由最终的整文件 md5 兜底。想丢掉 part 从头传带 `restart=true`。
+
+真机验证（100，60MB 随机数据）：3 秒超时掐断 → part 留 16 片 → 续传 `resumed_from=16777216`、实传 44MB、`md5_local == md5_remote == 原文`、part 消失。下载方向同样（`resumed_from=22020096`，续传 16.9 MB/s）。
+
+### 校验
+
+传完在**两端各算一次整文件 md5**，不符就不 rename、不删 part、返回 `verified: false` 加续传提示。远端 md5 用 `md5sum`（实测 0.12s / 200MB），而不是把文件读回来算 —— 后者按 11 MB/s 要 18s。
+
+### 传输不能成为清单的绕过口
+
+这是文件通道最要紧的一条。`ssh_guard` 只看命令字符串，SFTP 的写不经过它。100 上实测过缺口：
+
+```
+exec  echo key >> /home/qy/.ssh/authorized_keys  ->  blocked, rule="deny:写入敏感文件 ..."
+SFTP  open(同一路径, "a")                        ->  成功
+```
+
+所以 `put_file` 的 `remote` 必须过 `ssh_guard.check_write_target()`（复用同一份 `SENSITIVE_WRITE_TARGETS`，不复制规则），在**受保护主机**上生效（root 恒查 / `guarded_hosts` 点名 / 本次带 `elevate`）。命中返回和 `exec` 同形的 `{blocked, rule, hint}`，`force=true` 可越过。已验证：点名状态下写 `authorized_keys` 被拦；带 `force` 越过清单后仍被覆盖保护挡住，文件尺寸 101→101，一个字节都没写出去。
+
+### 落到 root 独占路径
+
+SFTP 以登录用户身份写 `/root`、`/etc` 实测都是 `Permission denied`，sudo 又给不了 SFTP，所以 `elevate=true` 走两段式：
+
+- 上传：SFTP 到 `~/.sshmcp-xfer/<名>.part` → `exec(elevate)` 跑 `install -m <mode> <part> <目标> && rm part`
+- 下载：`exec(elevate)` 把源 `cat` 到 `~/.sshmcp-xfer/<名>.in.part` → SFTP 取回 → 删暂存
+
+暂存**不放 `/tmp`**：100 的 `/tmp` 是 tmpfs（15.2G，机器 30G 内存），按 4GB 上限算，一个临时文件就吃掉 4GB 内存。`~/.sshmcp-xfer` 落在 ext4（实测可用 849G）。
+
+覆盖保护独立于清单：同名文件已存在时默认拒（`remote_exists` / `local_exists`），要覆盖显式 `overwrite=true`。注意普通 `sftp.rename` 在目标已存在时回 `Failure`（100 实测），所以覆盖走 `posix_rename`。
+
+### 本机落盘目录
+
+`get_file` 的默认位置按三级解析，改哪级都是热加载：
+
+1. 环境变量 `SSHMCP_XFER`
+2. `policy.json` 的 `defaults.xfer_dir` ← 本机已设为 **`D:\temporaryfile\download`**
+3. 都没有 → 系统真实下载目录（Windows 读注册表 `User Shell Folders` 的 `{374DE290-123F-4565-9164-39C4925E467B}`，因为下载目录可能被重定向到别的盘；本机该值是 `C:\Users\qiyue\Downloads`）
+
+预算：`max_transfer_bytes` 4GB、`xfer_chunk_bytes` 1MB、`xfer_timeout_s` 1800。`doctor` 会实测目录可写并对比空闲（`D:` 现余 255.6GB），空闲装不下一个上限文件时会提示。
+
+**远端文件的原文会落到你硬盘**，和 `output/` 一样不脱敏。开发过程中我自己演示过反面教材：提权 `cat /etc/shadow` 之后那行内容整段躺在 `output/*.log` 里，是按 `output_id` 逐个对审计才清干净的。建议判断类需求只读结论（`stat`、`grep -c`），别整读口令/私钥文件。
+
+### 传输的已知边界
+
+1. 依赖远端有 sftp-server（100 实测有）。没有就报错，不做 base64 兜底。
+2. 4GB @ 实测 10 MB/s 单向约 7 分钟，1800s 够用；但**跨调用没有 job id**，中断只能靠「用同一组参数再调一次」续传，无法取消别人发起的传输。
+3. 只传单文件（v1 明确排除目录批量）；要传目录自己 `exec tar czf` 再传归档。
+4. 分片 1MB，续传粒度到不了字节；末尾不足一片一律重传。
+5. 66 的传输没验过（真机限定在 100）。它的清单保护由 `guarded_hosts` 点名提供，传输目标检查同样生效。
 
 **输出默认只回头尾两截。** `exec` 内联是 stdout 头 4KB + 省略标记 + 尾 4KB（stderr 是 1KB/2KB），全文写进本机 `output/<output_id>.{out,err}.log`；`truncated: true` 时返回值里带 `read_full` 提示怎么用 `read_output`。留尾部是重点 —— `make`/`pip`/`apt` 的失败原因就在最后几行，早先「留头弃尾」会把报错整块丢掉。
 

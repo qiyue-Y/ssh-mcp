@@ -6,6 +6,17 @@
 
 ---
 
+## 2026-09-29 · 没有文件传输工具（已知边界；变通已实测）
+
+- **症状**：需要把远端文件搬回本机（或反向）时，六个工具里没有任何传输能力；`exec` 的输出单文件落盘上限 `max_output_bytes`（8MB），一次 exec 最多带回 8MB。
+- **变通（真机实测，128MB / 18 块全量 md5 与远端一致）**：远端 `dd if=FILE bs=8000000 skip=N count=1 status=none` 逐块输出，本地把 `output/<run_id>.out.log` 按顺序 `cat >>` 拼回目标文件。要点：
+  1. 落盘是**原始字节**（`open("wb")`），二进制安全，不需要 base64；
+  2. 每块 ≤ 8388608 字节，且命令除数据外不能有别的 stdout（dd 加 `status=none`）；
+  3. 输出按 run 轮转（默认 200 run / 500MB），每块收到后尽快拼走；每块会有一段二进制乱码内联回显（头 4KB+尾 4KB），属预期；
+  4. 分块之间彼此独立，可并行发多条 exec（各开独立 channel）。
+- **影响面**：搬 100MB 量级可行但笨重（≈18 次 exec），大目录同步不建议走这条路。
+- **建议**：给 ssh_mcp 补一个 `get`/`put`（paramiko SFTP，复用现有凭据、指纹与审计）。
+
 ## 2026-09-29 · 权限控制解除，只留 killlist（决策记录）
 
 - **变更**：`ssh_policy.py`(566) → `ssh_guard.py`(~315)。ro 白名单 / rw 黑名单 / grant / CLI `grant`+`revoke` / Windows 确认框全部移除。`exec` 新增 `force`，`max_duration` 不再被服务端夹制，新增 `pin_hostkey` 工具（探测不发凭据，落盘要 `trust=true`，写本机 `hostkeys.json`）。可连主机从「policy.json + 凭据文件双白名单」改为「凭据文件里有这条即可」。
@@ -57,6 +68,24 @@
 
 - **`timed_out` 误报种类**：`wait = min(idle, 剩余时长)` 之后统一把 `socket.timeout` 记成 `idle`，于是传 `max_duration=1` 得到的也是 `idle`，调用方会以为自己的时长没生效。改成按「这一轮谁定的 wait」报 `duration`/`idle`（`_drain`）。别用 `monotonic() >= deadline` 判 —— 边界上会抖，真机第一次就是这么漏的。
 - **`read_output` 的 `grep` 是子串匹配不是正则**：`pattern="^199999$"` 命中 0 行。行为没改（改正则会让现有肌肉记忆失效），只把工具描述和 README 写清了。
+
+## 2026-09-29 · 文件传输通道（新增，附三个实测踩出来的坑）
+
+新增 `put_file` / `get_file` / `xfer_stat`（分片断点续传 + 双向 md5 + root 两段式）。三个坑都是真机抓的，别改回去：
+
+1. **pipelined 异步写会让 part 状态漂移**。第一版只在收尾 flush，超时中断时实测 part 是 12MB，下次再看成了 60MB —— 已入队的写在异常后还会继续落服务端，续传点建立在假状态上。改成**每片 flush**，吞吐反而从 5.9 涨到 10.1 MB/s（与 `sftp.put` 持平）。回归用例：`test_every_chunk_is_flushed`。
+2. **普通 `sftp.rename` 不能覆盖已存在的目标**：100 实测回 `Failure`，`posix_rename` 才成功。所以 `overwrite=true` 必须走 `posix_rename`。
+3. **`paramiko 5.0` 没有 `SCPClient`**（`hasattr` 实测 False），scp 路线要引第三方依赖；同时 `SFTPClient.get_version()` 也没了。别照旧文章写 scp 兜底。
+
+另外三条设计约束（都有实测支撑，写在 README）：暂存不能放 `/tmp`（100 的 `/tmp` 是 tmpfs 15.2G，4GB 上限会吃内存）；传输目标必须走 `ssh_guard.check_write_target`（否则 SFTP 是清单的绕过口，缺口已实测）；远端 md5 用 `md5sum` 而不是读回来算（0.12s vs 18s / 200MB）。
+
+## 2026-09-29 · 传输没有跨调用取消，也没有目录批量（P2，按用户决定不做）
+
+- **症状**：中断的传输只能由"用同一组参数再调一次"续传，无法取消别人发起的那次；目录要靠调用方自己 `exec tar czf` 再传归档。
+- **根因**：v1 不设 job id（`xfer_timeout_s` 到点自己停，part 留在原地）。用户明确"v1 只做单文件"。
+- **最小复现**：`put_file` 超时返回 `aborted` + `part`，再调一次走 `resumed_from`；想推掉别人的传输只能 `restart=true` 从头传。
+- **要不要修**：真要取消/进度得加 job 表和一个 `xfer_cancel(job_id)`，那是另一套状态机。等有并发传大文件的实际痛点再说。
+- **未验部分**：66 的传输路径没在真机跑过（真机限定 100）。
 
 ## 2026-09-29 · 提权口令错时会挂到 idle 超时（已修，勿回退）
 

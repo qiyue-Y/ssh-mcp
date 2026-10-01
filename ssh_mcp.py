@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import socket
 import sys
 import threading
@@ -43,7 +44,34 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import ssh_guard as G  # noqa: E402
+import ssh_xfer as X  # noqa: E402
 import output_store as OS  # noqa: E402
+
+
+def _downloads_dir() -> Path:
+    """本机默认下载目录。Windows 的下载目录可能被重定向到别的盘，所以读注册表而不是猜。"""
+    if os.name == "nt":
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+            ) as key:
+                raw, _ = winreg.QueryValueEx(key, "{374DE290-123F-4565-9164-39C4925E467B}")
+            return Path(os.path.expandvars(str(raw)))
+        except OSError:
+            return Path.home() / "Downloads"
+    return Path.home() / "Downloads"
+
+
+def xfer_dir(guard: G.GuardConfig) -> Path:
+    """优先级：SSHMCP_XFER 环境变量 > policy.json 的 defaults.xfer_dir > 平台下载目录。"""
+    if os.environ.get("SSHMCP_XFER"):
+        return Path(os.environ["SSHMCP_XFER"]).expanduser()
+    if guard.xfer_dir:
+        return Path(guard.xfer_dir).expanduser()
+    return _downloads_dir()
 
 
 def _path_from_env(var: str, default: Path) -> Path:
@@ -759,6 +787,10 @@ def _tool_list_hosts() -> dict:
                     "max_output_file_bytes": guard.max_output_bytes,
                     "inline_output": f"stdout 头 {INLINE_OUT[0]}B + 尾 {INLINE_OUT[1]}B（stderr {INLINE_ERR[0]}/{INLINE_ERR[1]}），全文用 read_output(output_id) 回捞",
                     "output_retention": f"{OUTPUT_KEEP_DAYS} 天 / ≤{OUTPUT_KEEP_RUNS} run / ≤{OUTPUT_KEEP_BYTES // 1048576}MB",
+                    "xfer_dir": str(xfer_dir(guard)),
+                    "max_transfer_bytes": guard.max_transfer_bytes,
+                    "xfer_chunk_bytes": guard.xfer_chunk_bytes,
+                    "xfer_timeout_s": guard.xfer_timeout_s,
                 },
             }
         )
@@ -813,6 +845,279 @@ def _tool_pin_hostkey(host: str, trust: bool = False) -> dict:
     audit({"host": host, "command": f"<pin_hostkey {'replace' if expected else 'first'}>", "event": "hostkey_pinned", "previous": expected or None, "fingerprint": actual})
     out.update({"pinned": actual, "pin_source": "hostkeys", "match": True, "hint": "已写入 hostkeys.json，exec 可用"})
     return out
+
+
+STAGING_DIRNAME = ".sshmcp-xfer"
+
+
+def _sftp_of(alias: str, cred: HostCred, pin: str):
+    return POOL.client(cred, pin).open_sftp()
+
+
+def _remote_home(sftp) -> str:
+    return sftp.normalize(".")
+
+
+def _transfer_guard(cred: HostCred, alias: str, remote: str, elevate: bool, force: bool) -> dict | None:
+    """传输落点必须和 exec 走同一张清单，否则 SFTP 就是清单的绕过口。"""
+    guard = GUARD.get()
+    if not (G.applies(cred.privileged, alias, guard) or elevate):
+        return None
+    hit = G.check_write_target(remote)
+    if hit is None or force:
+        return None
+    return _block(alias, f"<put> {remote}", "killlisted", hit.rule, "确需写入请带 force=true 重发")
+
+
+def _tool_put_file(host: str, local: str, remote: str, overwrite: bool = False, force: bool = False,
+                   elevate: bool = False, restart: bool = False, mode: str = "") -> dict:
+    guard = GUARD.get()
+    refusal, cred, pin = _preflight(host, f"<put> {local} -> {remote}")
+    if refusal is not None:
+        return refusal
+    if elevate and not cred.elevate:
+        return _block(host, f"<put> {remote}", "elevate_not_configured", "no_elevate", f"凭据文件里为 {host} 打开 elevate")
+    blocked = _transfer_guard(cred, host, remote, elevate, force)
+    if blocked is not None:
+        return blocked
+
+    src = Path(local).expanduser()
+    if not src.is_file():
+        return _block(host, f"<put> {remote}", "local_missing", "no_local", f"本机没有文件：{src}")
+    size = src.stat().st_size
+    if size > guard.max_transfer_bytes:
+        return _block(host, f"<put> {remote}", "too_large", "max_transfer_bytes",
+                      f"{size} 字节 > 上限 {guard.max_transfer_bytes}（policy.json 的 defaults.max_transfer_bytes）")
+
+    try:
+        audit({"host": host, "command": f"<put> {src} -> {remote}", "event": "intent",
+               "rule": "forced" if force else "pass", "elevated": elevate or None, "bytes": size})
+    except OSError as exc:
+        return _block(host, f"<put> {remote}", "audit_write_failed", "audit_unwritable", f"审计目录不可写：{exc}")
+
+    deadline = time.monotonic() + guard.xfer_timeout_s
+    out: dict = {"host": host, "direction": "put", "local": str(src), "remote": remote, "bytes": size}
+    sftp = None
+    try:
+        sftp = _sftp_of(host, cred, pin)
+        if restart:
+            _drop_remote(sftp, X.part_path_for(remote))
+        existing = _remote_stat_size(sftp, remote)
+        if existing is not None and not overwrite:
+            out["hint"] = f"远端已存在 {remote}（{existing} 字节）。确认要覆盖就带 overwrite=true"
+            out["blocked"] = True
+            out["reason"] = "remote_exists"
+            return out
+
+        if elevate:
+            stage = f"{_remote_home(sftp)}/{STAGING_DIRNAME}"
+            _ensure_remote_dir(sftp, stage)
+            part = f"{stage}/{Path(remote).name}.part"
+        else:
+            part = X.part_path_for(remote)
+
+        out["part"] = part
+        have = _remote_stat_size(sftp, part) or 0
+        tr = X.push(sftp, str(src), part, chunk=guard.xfer_chunk_bytes, deadline=deadline,
+                    total_limit=guard.max_transfer_bytes)
+        out.update({"seconds": round(tr.seconds, 2), "rate_mb_s": round(tr.rate, 1),
+                    "resumed_from": tr.resumed_from, "chunks": tr.chunks,
+                    "part_before": have})
+
+        local_md5 = X.md5_of_file(str(src), deadline=deadline)
+        remote_md5 = _remote_md5(cred, pin, part, host, deadline)
+        out.update({"md5_local": local_md5, "md5_remote": remote_md5, "md5_match": local_md5 == remote_md5})
+        if remote_md5 is None or local_md5 != remote_md5:
+            out["verified"] = False
+            out["hint"] = "md5 不符或算不出来，part 已保留：修好后带同一参数重调会从缺口继续（不是从头重传）"
+            return out
+
+        if elevate:
+            install = f"install -m {shlex.quote(mode or '0644')} -- {shlex.quote(part)} {shlex.quote(remote)} && rm -f -- {shlex.quote(part)}"
+            res = run_command(cred, pin, install, "~", guard.idle_timeout_s, guard.xfer_timeout_s,
+                              _throw_spill(guard), elevate=True)
+            out["finalize_exit_code"] = res.exit_code
+            out["finalize_stderr"] = res.stderr
+            if res.exit_code != 0:
+                out["verified"] = False
+                out["hint"] = f"install 失败，part 留在 {part}：看 finalize_stderr 后重调同一参数续传"
+                return out
+        else:
+            sftp.chmod(part, int(mode or "0644", 8))
+            _remote_rename(sftp, part, remote, overwrite)
+        out["verified"] = True
+        out["final"] = remote
+        audit({"host": host, "command": f"<put> {src} -> {remote}", "event": "transferred", "bytes": size,
+               "md5": local_md5, "resumed_from": tr.resumed_from, "seconds": out["seconds"],
+               "elevated": elevate or None})
+    except X.TransferAborted as exc:
+        out.update({"verified": False, "aborted": str(exc), "hint": "part 已保留，重调同一参数即从缺口续传"})
+    except Exception as exc:  # noqa: BLE001 - SFTP/OSError 形态太杂，原样回给调用方
+        out.update({"verified": False, "error": f"{type(exc).__name__}: {exc}"})
+    finally:
+        if sftp is not None:
+            sftp.close()
+    return out
+
+
+def _tool_get_file(host: str, remote: str, local: str = "", overwrite: bool = False,
+                   elevate: bool = False, restart: bool = False) -> dict:
+    guard = GUARD.get()
+    refusal, cred, pin = _preflight(host, f"<get> {remote}")
+    if refusal is not None:
+        return refusal
+    if elevate and not cred.elevate:
+        return _block(host, f"<get> {remote}", "elevate_not_configured", "no_elevate", f"凭据文件里为 {host} 打开 elevate")
+
+    root = xfer_dir(guard)
+    dest = Path(local).expanduser() if local else root / Path(remote).name
+    out: dict = {"host": host, "direction": "get", "remote": remote, "local": str(dest),
+                 "xfer_dir": str(root)}
+
+    try:
+        audit({"host": host, "command": f"<get> {remote} -> {dest}", "event": "intent",
+               "rule": "pass", "elevated": elevate or None})
+    except OSError as exc:
+        return _block(host, f"<get> {remote}", "audit_write_failed", "audit_unwritable", f"审计目录不可写：{exc}")
+
+    deadline = time.monotonic() + guard.xfer_timeout_s
+    sftp = None
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        sftp = _sftp_of(host, cred, pin)
+        src = remote
+        if elevate:
+            stage = f"{_remote_home(sftp)}/{STAGING_DIRNAME}"
+            _ensure_remote_dir(sftp, stage)
+            src = f"{stage}/{Path(remote).name}.in.part"
+            dump = f"cat -- {shlex.quote(remote)} > {shlex.quote(src)}"
+            res = run_command(cred, pin, dump, "~", guard.idle_timeout_s, guard.xfer_timeout_s,
+                              _throw_spill(guard), elevate=True)
+            if res.exit_code != 0:
+                out.update({"verified": False, "error": f"远端读取失败：{res.stderr[:200]}"})
+                return out
+
+        size = sftp.stat(src).st_size
+        out["bytes"] = size
+        if size > guard.max_transfer_bytes:
+            return {**out, "verified": False, "reason": "too_large",
+                    "hint": f"{size} 字节 > defaults.max_transfer_bytes={guard.max_transfer_bytes}"}
+        free = shutil.disk_usage(str(dest.parent)).free
+        if free < size:
+            return {**out, "verified": False, "reason": "local_no_space",
+                    "hint": f"{dest.parent} 只剩 {free} 字节，放不下 {size}"}
+        if dest.exists() and not overwrite:
+            return {**out, "blocked": True, "reason": "local_exists",
+                    "hint": f"本机已有 {dest}。要覆盖带 overwrite=true，或换 local="}
+
+        part = dest.with_name(dest.name + X.PART_SUFFIX)
+        if restart and part.exists():
+            part.unlink()
+        out["part"] = str(part)
+        have = part.stat().st_size if part.exists() else 0
+        tr = X.pull(sftp, src, str(part), chunk=guard.xfer_chunk_bytes, deadline=deadline,
+                    total_limit=guard.max_transfer_bytes)
+        out.update({"seconds": round(tr.seconds, 2), "rate_mb_s": round(tr.rate, 1),
+                    "resumed_from": tr.resumed_from, "chunks": tr.chunks, "part_before": have})
+
+        local_md5 = X.md5_of_file(str(part), deadline=deadline)
+        remote_md5 = _remote_md5(cred, pin, src, host, deadline)
+        out.update({"md5_local": local_md5, "md5_remote": remote_md5, "md5_match": local_md5 == remote_md5})
+        if remote_md5 is None or local_md5 != remote_md5:
+            out["verified"] = False
+            out["hint"] = "md5 不符，part 已保留：重调同一参数从缺口续传"
+            return out
+
+        os.replace(part, dest)
+        out.update({"verified": True, "final": str(dest)})
+        if elevate:
+            _remote_rm(cred, pin, src, host, guard)
+        audit({"host": host, "command": f"<get> {remote} -> {dest}", "event": "transferred", "bytes": size,
+               "md5": local_md5, "resumed_from": tr.resumed_from, "seconds": out["seconds"],
+               "elevated": elevate or None})
+    except X.TransferAborted as exc:
+        out.update({"verified": False, "aborted": str(exc), "hint": "part 已保留，重调同一参数即续传"})
+    except Exception as exc:  # noqa: BLE001
+        out.update({"verified": False, "error": f"{type(exc).__name__}: {exc}"})
+    finally:
+        if sftp is not None:
+            sftp.close()
+    return out
+
+
+def _tool_xfer_stat(host: str, remote: str) -> dict:
+    refusal, cred, pin = _preflight(host, f"<stat> {remote}")
+    if refusal is not None:
+        return refusal
+    try:
+        sftp = _sftp_of(host, cred, pin)
+        try:
+            st = sftp.stat(remote)
+        finally:
+            sftp.close()
+        return {
+            "host": host,
+            "remote": remote,
+            "exists": True,
+            "size": st.st_size,
+            "mode": oct(st.st_mode or 0),
+            "uid": st.st_uid,
+            "gid": st.st_gid,
+            "mtime": st.st_mtime,
+        }
+    except IOError as exc:
+        hint = "路径不存在，或它只有 root 可读 —— 那种情况用 exec(elevate=true) 的 stat 看"
+        return {"host": host, "remote": remote, "exists": False, "error": str(exc), "hint": hint}
+
+
+def _throw_spill(guard):
+    """给 run_command 用的临时 Spill：finalize 步骤只关心退出码，不要输出。"""
+    return OS.Spill(OUTPUT_ROOT, uuid.uuid4().hex, guard.max_output_bytes, {"out": INLINE_OUT, "err": INLINE_ERR})
+
+
+def _remote_stat_size(sftp, path: str) -> int | None:
+    try:
+        return sftp.stat(path).st_size
+    except IOError:
+        return None
+
+
+def _ensure_remote_dir(sftp, path: str) -> None:
+    try:
+        sftp.mkdir(path)
+    except IOError:
+        pass  # 已存在是正常路径，报错交给后续写入
+
+
+def _drop_remote(sftp, path: str) -> None:
+    try:
+        sftp.remove(path)
+    except IOError:
+        pass
+
+
+def _remote_rename(sftp, part: str, target: str, replace: bool) -> None:
+    """覆盖必须走 posix_rename：普通 rename 在目标已存在时回 Failure（100 实测）。"""
+    if replace:
+        sftp.posix_rename(part, target)
+    else:
+        sftp.rename(part, target)
+
+
+def _remote_md5(cred: HostCred, pin: str, path: str, alias: str, deadline: float) -> str | None:
+    """远端算 md5 而不是把文件读回来算：实测 md5sum 0.12s/200MB，
+    而用 SFTP 读回来算要 18s（11 MB/s），差两个数量级。"""
+    guard = GUARD.get()
+    cmd = f"md5sum -- {shlex.quote(path)} | cut -d' ' -f1"
+    res = run_command(cred, pin, cmd, "~", guard.idle_timeout_s, max(60.0, deadline - time.monotonic()), _throw_spill(guard))
+    if res.exit_code != 0:
+        return None
+    text = res.stdout.strip()
+    return text.splitlines()[-1] if text else None
+
+
+def _remote_rm(cred: HostCred, pin: str, path: str, alias: str, guard) -> None:
+    run_command(cred, pin, f"rm -f -- {shlex.quote(path)}", "~", guard.idle_timeout_s, 60.0, _throw_spill(guard))
 
 
 def _tool_session_reset(host: str) -> dict:
@@ -898,6 +1203,63 @@ def build_server():
         import anyio
 
         return await anyio.to_thread.run_sync(lambda: _tool_pin_hostkey(host, trust))
+
+    @server.tool(
+        name="put_file",
+        description=(
+            "本机 -> 远端，分片断点续传 + 整文件 md5 校验。中断后再调同一参数会从缺口那片继续，不重头传。"
+            "写入目标受 exec 那张清单约束（authorized_keys/sshd_config/sudoers 之类会被拦），force=true 可越过。"
+            "远端已存在同名文件时默认拒绝，要覆盖带 overwrite=true。"
+            "elevate=true 走两段式：先落到远端 ~/.sshmcp-xfer/ 再 sudo install 到目标（/root、/etc 只有这样才能写）。"
+            "上限取 policy.json 的 defaults.max_transfer_bytes（现 4GB）。"
+        ),
+    )
+    async def _put_file(
+        host: str,
+        local: str,
+        remote: str,
+        overwrite: bool = False,
+        force: bool = False,
+        elevate: bool = False,
+        restart: bool = False,
+        mode: str = "",
+    ) -> dict:
+        import anyio
+
+        return await anyio.to_thread.run_sync(
+            lambda: _tool_put_file(host, local, remote, overwrite, force, elevate, restart, mode)
+        )
+
+    @server.tool(
+        name="get_file",
+        description=(
+            "远端 -> 本机，落盘目录取 policy.json 的 defaults.xfer_dir（默认是系统下载目录），local 可覆盖。"
+            "同样分片续传 + md5 校验；part 文件按目标名固定，中断后重调同一参数续传。"
+            "读 root 才可见的文件用 elevate=true（服务端先 sudo cat 到暂存再取回）。"
+        ),
+    )
+    async def _get_file(
+        host: str,
+        remote: str,
+        local: str = "",
+        overwrite: bool = False,
+        elevate: bool = False,
+        restart: bool = False,
+    ) -> dict:
+        import anyio
+
+        return await anyio.to_thread.run_sync(
+            lambda: _tool_get_file(host, remote, local, overwrite, elevate, restart)
+        )
+
+    @server.tool(
+        name="xfer_stat",
+        description="取远端文件的 size/mode/uid/mtime，用于传前判断该不该传（比 exec ls -l 少一次文本解析）。不建立传输。",
+    )
+    async def _xfer_stat(host: str, remote: str) -> dict:
+        import anyio
+
+        return await anyio.to_thread.run_sync(lambda: _tool_xfer_stat(host, remote))
 
     @server.tool(name="session_reset", description="丢弃某主机的 SSH 连接与 cwd 状态并重新握手。")
     async def _session_reset(host: str) -> dict:
@@ -993,6 +1355,23 @@ def cmd_doctor(_: argparse.Namespace) -> int:
             print(f"{mod} 可导入 ✓")
         except ImportError as exc:
             print(f"{mod} 导入失败：{exc}")
+    dest = xfer_dir(guard)
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        probe = dest / ".sshmcp-write-probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        free = shutil.disk_usage(str(dest)).free
+        print(
+            f"下载目录可写 ✓ {dest}\n"
+            f"  空闲 {free / 1024**3:.1f} GB，单文件上限 {guard.max_transfer_bytes / 1024**3:.0f} GB，"
+            f"分片 {guard.xfer_chunk_bytes // 1024} KB，单次超时 {guard.xfer_timeout_s:.0f}s"
+        )
+        if free < guard.max_transfer_bytes:
+            print(f"  注意：空闲不足一个上限文件，传大文件前先挪东西")
+    except OSError as exc:
+        print(f"\n下载目录不可写：{exc}（get_file 会直接失败）")
+        return 1
     return 0
 
 

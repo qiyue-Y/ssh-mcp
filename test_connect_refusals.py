@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -48,6 +49,7 @@ os.environ["SSHMCP_HOSTKEYS"] = str(_TMP / "hostkeys.json")
 os.environ["SSHMCP_OUTPUT"] = str(_TMP / "output")
 os.environ["SSHMCP_POLICY"] = str(_POLICY)
 
+import ssh_guard as G  # noqa: E402
 import ssh_mcp as M  # noqa: E402
 import output_store as OS  # noqa: E402
 
@@ -556,6 +558,221 @@ class KilllistWiring(unittest.TestCase):
             res = M.execute("admin", "cd /tmp")
         self.assertEqual(res["cwd_after"], "/tmp")
         self.assertEqual(M.POOL.cwd("admin"), "/tmp")
+
+
+class SftpStub:
+    """只实现传输用到的那几个方法。opened 计数用来证明「被拦时根本没连」。"""
+
+    def __init__(self, files=None):
+        self.files = dict(files or {})
+        self.renamed = []
+        self.posix = []
+
+    def stat(self, path):
+        if path not in self.files:
+            raise IOError("No such file")
+        return type("S", (), {"st_size": len(self.files[path]), "st_mode": 0o100644,
+                              "st_uid": 1000, "st_gid": 1000, "st_mtime": 0})()
+
+    def normalize(self, path):
+        return "/home/qy"
+
+    def mkdir(self, path):
+        pass
+
+    def remove(self, path):
+        self.files.pop(path, None)
+
+    def file(self, path, mode="r", bufsize=-1):
+        buf = self.files.setdefault(path, bytearray())
+        if "w" in mode:
+            buf.clear()
+        return Handle(buf, self)
+
+    def open(self, path, mode="rb"):
+        if path not in self.files:
+            raise IOError("No such file")
+        return Handle(self.files[path], self)
+
+    def chmod(self, path, mode):
+        pass
+
+    def rename(self, old, new):
+        if new in self.files:
+            raise IOError("Failure")  # openssh 实测：目标存在就失败
+        self.renamed.append((old, new))
+        self.files[new] = self.files.pop(old)
+
+    def posix_rename(self, old, new):
+        self.posix.append((old, new))
+        self.files[new] = self.files.pop(old)
+
+    def close(self):
+        pass
+
+
+class Handle:
+    def __init__(self, buf, owner):
+        self.buf = buf
+        self.owner = owner
+        self.pos = 0
+
+    def set_pipelined(self, v=True):
+        pass
+
+    def prefetch(self, size=None):
+        pass
+
+    def flush(self):
+        self.owner.flushes = getattr(self.owner, "flushes", 0) + 1
+
+    def seek(self, n):
+        self.pos = n
+
+    def read(self, n=-1):
+        out = bytes(self.buf[self.pos : self.pos + n])
+        self.pos += len(out)
+        return out
+
+    def write(self, data):
+        end = self.pos + len(data)
+        if end > len(self.buf):
+            self.buf.extend(b"\0" * (end - len(self.buf)))
+        self.buf[self.pos : end] = data
+        self.pos = end
+
+    def truncate(self, size):
+        del self.buf[size:]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class TransferWiring(unittest.TestCase):
+    """拒绝路径必须离线可钉：真机测一次就变了，不能当回归。"""
+
+    CRED = {"address": REAL_IP, "username": "qy", "auth": "password", "password": "login-secret",
+            "hostKey": WRONG_FP, "elevate": True}
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="xfer-wire-"))
+        self.src = self.tmp / "a.txt"
+        self.src.write_bytes(b"hello" * 4)
+        os.environ["SSHMCP_XFER"] = str(self.tmp / "dl")
+
+    def tearDown(self):
+        os.environ.pop("SSHMCP_XFER", None)
+
+    def test_sensitive_target_blocked_before_any_sftp(self):
+        """点名主机上写 authorized_keys：必须被拦，且一次 SFTP 都不开。"""
+        write_hosts({"guarded-user": dict(self.CRED)})
+        opened = []
+        with mock.patch.object(M, "_sftp_of", side_effect=lambda *a: opened.append(1)):
+            r = M._tool_put_file("guarded-user", str(self.src), "/home/qy/.ssh/authorized_keys")
+        self.assertTrue(r["blocked"])
+        self.assertEqual(r["reason"], "killlisted")
+        self.assertIn("authorized_keys", r["rule"])
+        self.assertEqual(opened, [], "被拦就不该建 SFTP 通道")
+
+    def test_unguarded_host_is_not_target_checked(self):
+        """没点名的非 root 主机不查目标 —— 与 exec 的语义一致，不能只给传输加严。"""
+        write_hosts({"100": dict(self.CRED)})
+        stub = SftpStub()
+        with mock.patch.object(M, "_sftp_of", return_value=stub), \
+             mock.patch.object(M, "_remote_md5", return_value=hashlib.md5(self.src.read_bytes()).hexdigest()):
+            r = M._tool_put_file("100", str(self.src), "/home/qy/.ssh/authorized_keys", overwrite=True)
+        self.assertTrue(r["verified"], str(r))
+
+    def test_elevate_not_configured(self):
+        write_hosts({"100": {k: v for k, v in self.CRED.items() if k != "elevate"}})
+        r = M._tool_put_file("100", str(self.src), "/tmp/x", elevate=True)
+        self.assertEqual(r["reason"], "elevate_not_configured")
+
+    def test_missing_local_file_is_reported(self):
+        write_hosts({"100": dict(self.CRED)})
+        r = M._tool_put_file("100", str(self.tmp / "nope.txt"), "/tmp/x")
+        self.assertTrue(r["blocked"])
+        self.assertEqual(r["reason"], "local_missing")
+
+    def test_too_large_refuses_without_connecting(self):
+        write_hosts({"100": dict(self.CRED)})
+        big = self.tmp / "big.bin"
+        big.write_bytes(b"0" * 4096)
+        guard = M.GUARD.get()
+        with mock.patch.object(guard, "max_transfer_bytes", 1024):
+            opened = []
+            with mock.patch.object(M, "_sftp_of", side_effect=lambda *a: opened.append(1)):
+                r = M._tool_put_file("100", str(big), "/tmp/x")
+        self.assertEqual(r["reason"], "too_large")
+        self.assertEqual(opened, [])
+
+    def test_remote_exists_is_a_separate_gate_from_force(self):
+        """force 只越清单，不能顺手把覆盖保护也越掉 —— 这是「挡手滑」的落点。"""
+        write_hosts({"100": dict(self.CRED)})
+        stub = SftpStub({"/tmp/that.txt": bytearray(b"old")})
+        with mock.patch.object(M, "_sftp_of", return_value=stub):
+            r = M._tool_put_file("100", str(self.src), "/tmp/that.txt", force=True)
+        self.assertTrue(r.get("blocked"))
+        self.assertEqual(r["reason"], "remote_exists")
+        self.assertEqual(bytes(stub.files["/tmp/that.txt"]), b"old", "一个字节都不该写出去")
+
+    def test_md5_mismatch_keeps_part_and_does_not_rename(self):
+        write_hosts({"100": dict(self.CRED)})
+        stub = SftpStub()
+        with mock.patch.object(M, "_sftp_of", return_value=stub), \
+             mock.patch.object(M, "_remote_md5", return_value="0" * 32):
+            r = M._tool_put_file("100", str(self.src), "/tmp/new.txt")
+        self.assertFalse(r["verified"])
+        self.assertEqual(stub.renamed, [], "md5 不符绝不能 rename 到位")
+        self.assertIn("part 已保留", r.get("hint", ""), r.get("hint"))
+
+    def test_successful_put_renames_and_audits(self):
+        write_hosts({"100": dict(self.CRED)})
+        stub = SftpStub()
+        md5 = hashlib.md5(self.src.read_bytes()).hexdigest()
+        with mock.patch.object(M, "_sftp_of", return_value=stub), \
+             mock.patch.object(M, "_remote_md5", return_value=md5):
+            r = M._tool_put_file("100", str(self.src), "/tmp/ok.txt")
+        self.assertTrue(r["verified"], str(r))
+        self.assertEqual(bytes(stub.files["/tmp/ok.txt"]), self.src.read_bytes())
+        rec = [x for x in M.audit_tail("100", 20) if x.get("event") == "transferred"]
+        self.assertTrue(rec, "成功的传输要进审计")
+        self.assertEqual(rec[0]["md5"], md5)  # audit_tail 是倒序，[0] 才是本次
+
+    def test_get_lands_in_configured_dir_and_verifies(self):
+        write_hosts({"100": dict(self.CRED)})
+        payload = "远端内容".encode("utf-8")
+        stub = SftpStub({"/tmp/src.bin": bytearray(payload)})
+        md5 = hashlib.md5(payload).hexdigest()
+        with mock.patch.object(M, "_sftp_of", return_value=stub), \
+             mock.patch.object(M, "_remote_md5", return_value=md5):
+            r = M._tool_get_file("100", "/tmp/src.bin")
+        self.assertTrue(r["verified"], str(r))
+        self.assertEqual(Path(r["xfer_dir"]), self.tmp / "dl")
+        self.assertEqual((self.tmp / "dl" / "src.bin").read_bytes(), payload)
+        self.assertFalse(list((self.tmp / "dl").glob("*part*")), "成功后不留 part")
+
+    def test_get_refuses_existing_local_without_overwrite(self):
+        write_hosts({"100": dict(self.CRED)})
+        dst_dir = self.tmp / "dl"
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        (dst_dir / "dup.bin").write_bytes("本机原有".encode("utf-8"))
+        stub = SftpStub({"/tmp/dup.bin": bytearray("远端新内容".encode("utf-8"))})
+        with mock.patch.object(M, "_sftp_of", return_value=stub):
+            r = M._tool_get_file("100", "/tmp/dup.bin")
+        self.assertEqual(r["reason"], "local_exists")
+        self.assertEqual((dst_dir / "dup.bin").read_bytes(), "本机原有".encode("utf-8"), "没同意覆盖就不能动本机文件")
+
+    def test_xfer_dir_priority_env_then_policy_then_registry(self):
+        g = G.GuardConfig(xfer_dir=r"D:\somewhere")
+        with mock.patch.dict(os.environ, {"SSHMCP_XFER": str(self.tmp)}):
+            self.assertEqual(M.xfer_dir(g), self.tmp)
+        os.environ.pop("SSHMCP_XFER", None)
+        self.assertEqual(M.xfer_dir(g), Path(r"D:\somewhere"))
+        self.assertEqual(M.xfer_dir(G.GuardConfig()), M._downloads_dir())
 
 
 if __name__ == "__main__":

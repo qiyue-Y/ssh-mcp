@@ -94,10 +94,10 @@ def main() -> int:
         tools = read_until(proc, 2).get("result", {}).get("tools", [])
         names = sorted(t["name"] for t in tools)
         print(f"tools/list  {time.monotonic() - t1:.2f}s  -> {names}")
-        for expect in ("audit_tail", "exec", "list_hosts", "pin_hostkey", "read_output", "session_reset"):
+        for expect in ("audit_tail", "exec", "get_file", "list_hosts", "pin_hostkey", "put_file", "read_output", "session_reset", "xfer_stat"):
             if expect not in names:
                 failures.append(f"缺工具 {expect}")
-        # 解除权限控制后仍要在 schema 里：越清单的开关、探测指纹的确认位
+        # 解除权限控制后仍要在 schema 里：越清单的开关、探测指纹的确认位、续传与覆盖开关
         schemas = {t["name"]: t.get("inputSchema", {}).get("properties", {}) for t in tools}
         if "force" not in schemas.get("exec", {}):
             failures.append("exec 缺 force 参数")
@@ -105,6 +105,11 @@ def main() -> int:
             failures.append("exec 缺 elevate 参数")
         if "trust" not in schemas.get("pin_hostkey", {}):
             failures.append("pin_hostkey 缺 trust 参数")
+        for name, params in (("put_file", ("overwrite", "force", "elevate", "restart", "mode")),
+                             ("get_file", ("overwrite", "elevate", "restart", "local"))):
+            for p in params:
+                if p not in schemas.get(name, {}):
+                    failures.append(f"{name} 缺 {p} 参数")
         for name in ("grant", "revoke"):
             if name in names:
                 failures.append(f"权限控制已解除，不该再有 {name}")
