@@ -144,11 +144,14 @@ sudo -S -p '' --user root -- sh -c '<原命令，含 cd 前缀>'
 ## 工具
 
 - `list_hosts()` —— 主机、`pin_source`、是否查清单、限额。不含密码。
-- `exec(host, command, cwd?, idle_timeout?, max_duration?, force?, elevate?)` —— 离散命令。被拦下时不建立连接。`elevate=true` 以 root 跑这一条（凭据里得先给这台开 `elevate`）。
+- `exec(host, command, cwd?, idle_timeout?, max_duration?, force?, elevate?, detach?)` —— 离散命令。`cwd` 由服务端按主机记忆：单发一条 `cd <目录>`（或光一个 `cd` 回 home）验活成功后写入，后续命令自动从该目录开始；`cd X && cmd` 复合形态只影响本条。被拦下时不建立连接。`elevate=true` 以 root 跑这一条（凭据里得先给这台开 `elevate`）。`detach=true` 丢后台跑并立刻返回 `job_id`（见「后台任务」一节）。
 - `pin_hostkey(host, trust?)` —— 探测主机指纹；`trust=true` 才写 `hostkeys.json`。
 - `put_file(host, local, remote, overwrite?, force?, elevate?, restart?, mode?)` —— 本机 → 远端，分片续传 + md5。
 - `get_file(host, remote, local?, overwrite?, elevate?, restart?)` —— 远端 → 本机，落 `defaults.xfer_dir`。
 - `xfer_stat(host, remote)` —— 远端 size/mode/uid/mtime，传前判断该不该传（省一次 `ls -l` 文本解析）。
+- `job_status(host, job_id, offset?, max_bytes?)` —— 读后台任务的状态与输出增量（`offset_next` 供下次只取新增）。
+- `job_kill(host, job_id)` —— 停后台任务：进程组 SIGTERM→5 秒后 SIGKILL，带队里子进程树，杀前核对 `job_is_ours`。
+- `job_list(host, limit?)` —— 列最近的后台任务（running/exited/killed/lost），找孤儿用。
 - `session_reset(host)` —— 丢连接与 cwd 重来。
 - `audit_tail(host?, limit?)` —— 回看最近审计（含被拦的）。
 - `read_output(output_id, stream?, mode?, start?, end?, pattern?, limit?)` —— 按 `exec` 返回的 `output_id` 回捞全文。`mode`：`head`/`tail` 按行边界取，`grep` 返回**带行号**的命中（`pattern` 是**子串**匹配，不是正则），`lines` 取 `[start,end]` 行；单次上限 16KB。
@@ -229,8 +232,22 @@ SFTP 以登录用户身份写 `/root`、`/etc` 实测都是 `Permission denied`�
 3. 只传单文件（v1 明确排除目录批量）；要传目录自己 `exec tar czf` 再传归档。
 4. 分片 1MB，续传粒度到不了字节；末尾不足一片一律重传。
 5. 66 的传输没验过（真机限定在 100）。它的清单保护由 `guarded_hosts` 点名提供，传输目标检查同样生效。
+6. **`st_size` 不可信的两类都已处理**：`/proc` 这类报 0 的伪文件按「长度未知」读到 EOF 取回（不做远端二次读取的 md5 校验——这类文件两次读取可能天然不同）；`/sys` 这类 stat 报 4096 而实际更短的，`bytes`/`chunks` 报**实际落盘量**。FIFO 直接拒（按 EOF 读会挂住等写者）。
 
 **输出默认只回头尾两截。** `exec` 内联是 stdout 头 4KB + 省略标记 + 尾 4KB（stderr 是 1KB/2KB），全文写进本机 `output/<output_id>.{out,err}.log`；`truncated: true` 时返回值里带 `read_full` 提示怎么用 `read_output`。留尾部是重点 —— `make`/`pip`/`apt` 的失败原因就在最后几行，早先「留头弃尾」会把报错整块丢掉。
+
+## 后台任务（detach）
+
+`exec(..., detach=true)` 把命令丢到远端后台跑，立刻返回 `job_id`；配 `job_status` / `job_kill` / `job_list` 使用。**这是绕开「客户端 60 秒调用硬上限」的唯一出路**——实测任何单次 MCP 调用超过约 60 秒必报 `MCP tool invocation did not complete`（8 次报错与审计 intent 的时间差实测 60.4–60.9s），`max_duration` 传多大都没用。
+
+- 状态存**远端** `~/.sshmcp-jobs/<job_id>/`：`cmd` 命令原文、`dir` 工作目录、`out`（stdout+stderr 合并）、`pid`、`started`、`exit`、`killed`。MCP 服务重启、SSH 断连、Agent 换会话都能接着轮询（要点：状态不存服务进程内存）。
+- 判活必须过 `job_is_ours`：`/proc/<pid>/cmdline`（无 procfs 退 `ps -o args=`）里有这个 job id 才算 running —— `kill -0` 只证明「有进程占着这个 pid」，防 PID 复用误判/误杀。
+- `job_kill` 先对进程组 SIGTERM，5 秒不退再 SIGKILL，另有子进程树兜底（setsid 不可用的主机）；杀前同样过 `job_is_ours`。
+- `job_status` 给 `offset` 就只回新增部分（返回 `offset_next` 供下次接着取），不给就回最后 `max_bytes` 字节。输出只在远端 `out` 文件，不占本机 `output/` 配额。
+- 保留 7 天（按结束标记的 mtime 判，job-start 时顺手清）+ 并发上限 8，都可改 `policy.json` 的 `defaults.job_retention_days` / `job_max_concurrent`；超限时 `exec(detach=true)` 返回 `too_many_jobs`。
+- 审计：起/杀各记一条（`job_started` / `job_killed`，带 job_id）；`job_status` / `job_list` 是纯读，不审计。
+- **v1 明确排除**：elevate 的 detach（口令注入与 setsid 的组合没验过，会返回 `elevate_detach_unsupported`）；`out` 合并 stdout/stderr 不分离。
+- 脚本一律 POSIX sh、不含顶层 `exit`、不用 heredoc —— 为将来可能的 shell/交互通道留的（片段会被粘进活 shell，`exit` 会直接杀掉会话）。
 
 ## 全文日志与轮转
 

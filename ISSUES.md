@@ -8,6 +8,13 @@
 
 ---
 
+## 2026-10-14 · `cd ~` 被引号裹成字面量、光一个 `cd` 静默无效果（已修，回归用例钉着）
+
+- **症状**：`exec(host, command="cd ~")` 报 `cd: ~: 没有那个文件或目录`（100 实测，exit 1）。根因：探活串用 `shlex.quote(cd_target)` 把 `~` 裹成 `'~'`，远端 shell 不再展开；`cd ~/xxx` 与 `cwd="~/xxx"` 参数同病。另一处：光一个 `cd`（不带参数）此前不匹配 cd-only 分支，跑完静默无效果。
+- **修法**：新增 `_cd_expr()`（`ssh_mcp.py`），`~` / `~user` 与第一个 `/` 之前的头留在引号外、其余照旧引号保护，前缀与探活两处都换用它；`_cd_only_segment` 接受单 token 的 `cd`，按回 home 处理。
+- **真机复验（100）**：`cd ~` → `cwd_after=/home/qy`；`cd ~/no-such-xyz` 报错里是展开后的 `/home/qy/no-such-xyz`；带空格目录 `cd '/tmp/sshmcp cd dir'` 记住，下一条 `pwd` 命中。离线 +2 例：`test_cd_expr_keeps_tilde_out_of_the_quotes`、`test_cd_probe_forms`。
+- **语义备忘**：只有「单发一条 cd」或 `cwd` 参数改服务端记忆；`cd X && cmd` 复合形态只影响本条（与真 shell 的持久目录不同）。
+
 ## 2026-09-29 · 权限控制解除，只留 killlist（决策记录）
 
 - **变更**：`ssh_policy.py`(566) → `ssh_guard.py`(~315)。ro 白名单 / rw 黑名单 / grant / CLI `grant`+`revoke` / Windows 确认框全部移除。`exec` 新增 `force`，`max_duration` 不再被服务端夹制，新增 `pin_hostkey` 工具（探测不发凭据，落盘要 `trust=true`，写本机 `hostkeys.json`）。可连主机从「policy.json + 凭据文件双白名单」改为「凭据文件里有这条即可」。

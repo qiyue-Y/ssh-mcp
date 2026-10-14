@@ -30,6 +30,7 @@ import os
 import shlex
 import shutil
 import socket
+import stat
 import sys
 import threading
 import time
@@ -44,6 +45,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import ssh_guard as G  # noqa: E402
+import ssh_jobs as J  # noqa: E402
 import ssh_xfer as X  # noqa: E402
 import output_store as OS  # noqa: E402
 
@@ -548,9 +550,23 @@ def _sudo_wrap(inner: str, cred: HostCred) -> str:
     return f"sudo -S -p '' --user {shlex.quote(target)} -- sh -c {shlex.quote(inner)}"
 
 
+def _cd_expr(path: str) -> str:
+    """拼 cd 目标：波浪号头留在引号外，交给远端 shell 展开。
+
+    shlex.quote 会把 `~` 裹成字面量 `'~'`（实测 `cd ~` 报「没有那个文件或目录」），
+    所以只把 `~` / `~user` 与第一个 `/` 之前的头摘出来，剩余部分照旧引号保护。
+    """
+    head, sep, rest = path.partition("/")
+    if head[:1] == "~" and all(c.isalnum() or c in "._-" for c in head[1:]):
+        if not sep:
+            return head
+        return f"{head}/{shlex.quote(rest)}" if rest else f"{head}/"
+    return shlex.quote(path)
+
+
 def run_command(cred: HostCred, pin: str, command: str, cwd: str, idle_s: float, max_s: float, spill: OS.Spill, elevate: bool = False) -> RunResult:
     """在远端执行一条命令。cwd 由服务端记录，发送前才拼上。"""
-    sent = command if cwd in ("", "~") else f"cd {shlex.quote(cwd)} && {command}"
+    sent = command if cwd in ("", "~") else f"cd {_cd_expr(cwd)} && {command}"
     stdin: bytes | None = None
     if elevate:
         stdin = (cred.sudo_password() + "\n").encode("utf-8")
@@ -609,9 +625,9 @@ def _cd_only_segment(command: str) -> str | None:
     except G.GuardSyntaxError:
         return None
     segments = G.split_segments(tokens)
-    if len(segments) != 1 or len(segments[0]) != 2 or segments[0][0] != "cd":
+    if len(segments) != 1 or segments[0][0] != "cd" or len(segments[0]) > 2:
         return None
-    return segments[0][1]
+    return segments[0][1] if len(segments[0]) == 2 else "~"  # 光一个 cd 就是回 home
 
 
 def _preflight(alias: str, command: str) -> tuple[dict | None, HostCred | None, str]:
@@ -645,11 +661,15 @@ def _preflight(alias: str, command: str) -> tuple[dict | None, HostCred | None, 
     return (None, cred, pin)
 
 
-def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None, force: bool = False, elevate: bool = False) -> dict:
+def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None, force: bool = False, elevate: bool = False, detach: bool = False) -> dict:
     refusal, cred, pin = _preflight(alias, command)
     if refusal is not None:
         return refusal
 
+    if detach and elevate:
+        # 口令注入与 setsid 的组合没验过，v1 明确不做：先见 README「后台任务」
+        return _block(alias, command, "elevate_detach_unsupported", "no_elevate_detach",
+                      "v1 不支持 elevate 的后台任务，去掉 elevate 再发（要 root 就先想别的办法）")
     if elevate and not cred.elevate:
         return _block(alias, command, "elevate_not_configured", "no_elevate", f"凭据文件里为 {alias} 打开 elevate（那文件我不写）")
     if elevate and not cred.sudo_password():
@@ -657,7 +677,7 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
         return _block(alias, command, "elevate_password_missing", "no_elevate_password", f"elevate_password 与 password 都为空，在凭据文件里补一个")
 
     guard = GUARD.get()
-    cd_target = _cd_only_segment(command)
+    cd_target = None if detach else _cd_only_segment(command)
     # 清单查不查：root 账号恒查，非 root 看 guarded_hosts 点没点名，提权一律查 ——
     # 一旦以 root 落地，破坏面和 root 账号完全同级，不该因为登录账号是 qy 就免检
     # 单独的 cd 只改服务端记的 cwd，不触碰远端状态，也不必查
@@ -669,13 +689,16 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
 
     # fail closed：审计写不进去就不执行
     try:
-        audit({"host": alias, "command": command, "event": "intent", "rule": rule, "guarded": guarded, "elevated": elevate or None})
+        audit({"host": alias, "command": command, "event": "intent", "rule": rule, "guarded": guarded, "elevated": elevate or None, "detach": detach or None})
     except OSError as exc:
         return _block(alias, command, "audit_write_failed", "audit_unwritable", f"审计目录不可写：{exc}")
 
     idle_s = float(idle_timeout or guard.idle_timeout_s)
     max_s = float(max_duration or guard.max_duration_s)
     start_cwd = cwd or POOL.cwd(alias)
+
+    if detach:
+        return _start_job(alias, command, cred, pin, guard, start_cwd, rule, idle_s)
 
     # 全文落盘和审计同级：写不了就不执行，别把输出留在只有内存知道的地方
     try:
@@ -688,7 +711,7 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
 
     if cd_target is not None:
         # cd 的探活探测也按 elevate 走：`cd /root` 用主账号验会假失败，验过了才记 cwd
-        res = run_command(cred, pin, f"cd {shlex.quote(cd_target)} && pwd", start_cwd, idle_s, max_s, spill, elevate)
+        res = run_command(cred, pin, f"cd {_cd_expr(cd_target)} && pwd", start_cwd, idle_s, max_s, spill, elevate)
         end_cwd = res.stdout.strip().splitlines()[-1] if res.exit_code == 0 and res.stdout.strip() else start_cwd
         if res.exit_code == 0:
             POOL.set_cwd(alias, end_cwd)
@@ -803,8 +826,8 @@ def _tool_list_hosts() -> dict:
     }
 
 
-def _tool_exec(host: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None, force: bool = False, elevate: bool = False) -> dict:
-    return execute(host, command, cwd, idle_timeout, max_duration, force, elevate)
+def _tool_exec(host: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None, force: bool = False, elevate: bool = False, detach: bool = False) -> dict:
+    return execute(host, command, cwd, idle_timeout, max_duration, force, elevate, detach)
 
 
 def _tool_pin_hostkey(host: str, trust: bool = False) -> dict:
@@ -999,14 +1022,18 @@ def _tool_get_file(host: str, remote: str, local: str = "", overwrite: bool = Fa
                 out.update({"verified": False, "error": f"远端读取失败：{res.stderr[:200]}"})
                 return out
 
-        size = sftp.stat(src).st_size
-        out["bytes"] = size
+        st = sftp.stat(src)
+        size = st.st_size
+        if stat.S_ISFIFO(getattr(st, "st_mode", 0) or 0):
+            # FIFO 的 st_size 是 0，流式读到 EOF 会挂住等写者（最长到 xfer 超时）
+            return {**out, "bytes": size, "verified": False, "reason": "fifo",
+                    "hint": "FIFO 没有固定长度，get_file 会挂住等写者，直接拒；看内容用 exec 的 cat"}
         if size > guard.max_transfer_bytes:
-            return {**out, "verified": False, "reason": "too_large",
+            return {**out, "bytes": size, "verified": False, "reason": "too_large",
                     "hint": f"{size} 字节 > defaults.max_transfer_bytes={guard.max_transfer_bytes}"}
         free = shutil.disk_usage(str(dest.parent)).free
         if free < size:
-            return {**out, "verified": False, "reason": "local_no_space",
+            return {**out, "bytes": size, "verified": False, "reason": "local_no_space",
                     "hint": f"{dest.parent} 只剩 {free} 字节，放不下 {size}"}
         if dest.exists() and not overwrite:
             return {**out, "blocked": True, "reason": "local_exists",
@@ -1019,26 +1046,32 @@ def _tool_get_file(host: str, remote: str, local: str = "", overwrite: bool = Fa
         have = part.stat().st_size if part.exists() else 0
         tr = X.pull(sftp, src, str(part), chunk=guard.xfer_chunk_bytes, deadline=deadline,
                     total_limit=guard.max_transfer_bytes)
-        out.update({"seconds": round(tr.seconds, 2), "rate_mb_s": round(tr.rate, 1),
+        out.update({"bytes": tr.bytes, "seconds": round(tr.seconds, 2), "rate_mb_s": round(tr.rate, 1),
                     "resumed_from": tr.resumed_from, "chunks": tr.chunks, "part_before": have})
 
         local_md5 = X.md5_of_file(str(part), deadline=deadline)
-        remote_md5 = _remote_md5(cred, pin, src, host, deadline)
-        out.update({"md5_local": local_md5, "md5_remote": remote_md5, "md5_match": local_md5 == remote_md5})
-        if remote_md5 is None or local_md5 != remote_md5:
-            out["verified"] = False
-            out["hint"] = "md5 不符，part 已保留：重调同一参数从缺口续传"
-            return out
+        if size == 0:
+            # st_size=0（/proc 类）：两次读取的内容可能天然不同，二次读取算 md5 只会假红，跳过并说明
+            out.update({"md5_local": local_md5, "md5_check": "skipped_st_size_0",
+                        "hint": "该路径 st_size=0（如 /proc 伪文件），已按读到 EOF 取回；未做远端二次读取的 md5 校验（这类文件两次读取可能内容不同）"})
+        else:
+            remote_md5 = _remote_md5(cred, pin, src, host, deadline)
+            out.update({"md5_local": local_md5, "md5_remote": remote_md5, "md5_match": local_md5 == remote_md5})
+            if remote_md5 is None or local_md5 != remote_md5:
+                out["verified"] = False
+                out["hint"] = "md5 不符，part 已保留：重调同一参数从缺口续传"
+                return out
 
         os.replace(part, dest)
         out.update({"verified": True, "final": str(dest)})
         if elevate:
             _remote_rm(cred, pin, src, host, guard)
-        audit({"host": host, "command": f"<get> {remote} -> {dest}", "event": "transferred", "bytes": size,
+        audit({"host": host, "command": f"<get> {remote} -> {dest}", "event": "transferred", "bytes": out["bytes"],
                "md5": local_md5, "resumed_from": tr.resumed_from, "seconds": out["seconds"],
                "elevated": elevate or None})
     except X.TransferAborted as exc:
-        out.update({"verified": False, "aborted": str(exc), "hint": "part 已保留，重调同一参数即续传"})
+        out.update({"verified": False, "aborted": str(exc),
+                    "hint": "part 已保留，重调同一参数续传（st_size=0 的文件不续传，重调即整篇重读）"})
     except Exception as exc:  # noqa: BLE001
         out.update({"verified": False, "error": f"{type(exc).__name__}: {exc}"})
     finally:
@@ -1122,6 +1155,150 @@ def _remote_rm(cred: HostCred, pin: str, path: str, alias: str, guard) -> None:
     run_command(cred, pin, f"rm -f -- {shlex.quote(path)}", "~", guard.idle_timeout_s, 60.0, _throw_spill(guard))
 
 
+# --------------------------------------------------------------------------------------
+# 后台任务（detach）：状态存远端文件，服务重启/断连/换会话都不丢
+# --------------------------------------------------------------------------------------
+
+
+def _start_job(alias: str, command: str, cred: HostCred, pin: str, guard, start_cwd: str, rule: str, idle_s: float) -> dict:
+    """detach=true 的落点：把命令丢到远端后台，立刻带 job_id 回来。"""
+    try:
+        spill = _throw_spill(guard)
+    except OSError as exc:
+        return _block(alias, command, "output_unwritable", "output_unwritable", f"output 目录不可写：{exc}（全文日志与审计同为必备件）")
+    job_id = J.new_job_id()
+    directory = "" if start_cwd in ("", "~") else start_cwd
+    script = J.build_start_script(job_id, command, directory, guard.job_retention_days, guard.job_max_concurrent)
+    res = run_command(cred, pin, script, "~", idle_s, 60.0, spill)
+    parsed = J.parse_start(res.stdout)
+    if parsed["result"] == "busy":
+        out = _block(alias, command, "too_many_jobs", "job_max_concurrent",
+                     f"在跑或失联的任务已达上限 {guard.job_max_concurrent}（policy.json defaults.job_max_concurrent）：先 job_list 看清、job_kill 收尾再发")
+        out["busy"] = parsed.get("busy")
+        return out
+    if parsed["result"] != "started":
+        try:
+            audit({"host": alias, "command": command, "event": "job_start_failed", "rule": rule,
+                   "job_id": job_id, "reason": parsed["result"], "stderr": res.stderr[:300]})
+        except OSError:
+            pass
+        return {"host": alias, "command": command, "job_id": job_id, "detached": True, "state": "unknown",
+                "error": "job_not_started", "reason": parsed["result"], "exit_code": res.exit_code,
+                "stdout": res.stdout[:300], "stderr": res.stderr[:300],
+                "hint": "远端没写出 pid 文件：看 stdout/stderr（NOPID 多为目录不可写或缺 setsid/nohup）"}
+    audit({"host": alias, "command": command, "event": "job_started", "rule": rule, "job_id": job_id,
+           "pid": parsed.get("pid"), "dir": directory or "~"})
+    out = {"host": alias, "command": command, "job_id": job_id, "detached": True, "state": "running",
+           "pid": parsed.get("pid"), "cwd": start_cwd,
+           "next": f"job_status(host='{alias}', job_id='{job_id}') 看状态与输出；job_kill 停它"}
+    if rule == "forced":
+        out["forced_rule"] = rule
+    return out
+
+
+def _bad_job_id(host: str, job_id: str) -> dict | None:
+    try:
+        J.validate_job_id(job_id)
+    except ValueError as exc:
+        return {"host": host, "job_id": job_id, "error": "invalid_job_id", "hint": str(exc)}
+    return None
+
+
+def _tool_job_status(host: str, job_id: str, offset: int | None = None, max_bytes: int = 65536) -> dict:
+    bad = _bad_job_id(host, job_id)
+    if bad is not None:
+        return bad
+    refusal, cred, pin = _preflight(host, f"<job_status> {job_id}")
+    if refusal is not None:
+        return refusal
+    guard = GUARD.get()
+    limit = max(1, min(int(max_bytes), 1 << 20))
+    res = run_command(cred, pin, J.build_state_script(job_id), "~", guard.idle_timeout_s, 60.0, _throw_spill(guard))
+    if res.exit_code != 0:
+        return {"host": host, "job_id": job_id, "error": "state_probe_failed",
+                "exit_code": res.exit_code, "stderr": res.stderr[:300]}
+    st = J.parse_kv(res.stdout)
+    state = st.get("state") or "unknown"
+    if state == "missing":
+        return {"host": host, "job_id": job_id, "state": "missing",
+                "hint": "没有这个任务（从未启动过，或已过保留期被清）"}
+    size = int(st["out_bytes"]) if (st.get("out_bytes") or "").isdigit() else 0
+    start = max(0, size - limit) if offset is None else max(0, min(int(offset), size))
+    raw = b""
+    sftp = None
+    try:  # out 读不到不该把状态也吞掉：状态照报，内容留空
+        sftp = _sftp_of(host, cred, pin)
+        with sftp.open(f"{_remote_home(sftp)}/{J.JOBS_DIRNAME}/{job_id}/out", "rb") as fh:
+            fh.seek(start)
+            if size > start:
+                raw = fh.read(min(limit, size - start))
+    except Exception:  # noqa: BLE001
+        raw = b""
+    finally:
+        if sftp is not None:
+            sftp.close()
+    out = {
+        "host": host, "job_id": job_id, "state": state,
+        "exit_code": int(st["code"]) if (st.get("code") or "").isdigit() else None,
+        "started": int(st["started"]) if (st.get("started") or "").isdigit() else None,
+        "out_bytes": size,
+        "offset_next": start + len(raw),
+        "truncated": start + len(raw) < size,
+        "text": raw.decode("utf-8", "replace"),
+    }
+    if (st.get("pid") or "").isdigit():
+        out["pid"] = int(st["pid"])
+    if out["started"] and (st.get("now") or "").isdigit():
+        out["elapsed_s"] = max(0, int(st["now"]) - out["started"])
+    if (st.get("command") or "").strip():
+        out["command"] = st["command"]
+    return out
+
+
+def _tool_job_kill(host: str, job_id: str) -> dict:
+    bad = _bad_job_id(host, job_id)
+    if bad is not None:
+        return bad
+    refusal, cred, pin = _preflight(host, f"<job_kill> {job_id}")
+    if refusal is not None:
+        return refusal
+    guard = GUARD.get()
+    res = run_command(cred, pin, J.build_kill_script(job_id), "~", guard.idle_timeout_s, 30.0, _throw_spill(guard))
+    kv = J.parse_kv(res.stdout)
+    result = kv.get("result") or "unknown"
+    try:
+        audit({"host": host, "command": f"<job_kill> {job_id}", "event": "job_killed", "job_id": job_id,
+               "result": result, "state": kv.get("state"), "probe_exit": res.exit_code})
+    except OSError:
+        pass
+    out = {"host": host, "job_id": job_id, "result": result}
+    if kv.get("state"):
+        out["state"] = kv["state"]
+    if (kv.get("code") or "").isdigit():
+        out["exit_code"] = int(kv["code"])
+    if result == "missing":
+        out["hint"] = "没有这个任务（从未启动过，或已过保留期被清）"
+    elif result == "not_running":
+        out["hint"] = "任务已经不在跑（看 state/exit_code），没有可停的东西"
+    if res.exit_code != 0:
+        out["stderr"] = res.stderr[:300]
+    return out
+
+
+def _tool_job_list(host: str, limit: int = 20) -> dict:
+    refusal, cred, pin = _preflight(host, "<job_list>")
+    if refusal is not None:
+        return refusal
+    guard = GUARD.get()
+    n = max(1, min(int(limit), 200))
+    res = run_command(cred, pin, J.build_list_script(n), "~", guard.idle_timeout_s, 60.0, _throw_spill(guard))
+    if res.exit_code != 0:
+        return {"host": host, "error": "list_failed", "exit_code": res.exit_code, "stderr": res.stderr[:300]}
+    jobs = J.parse_list(res.stdout)
+    return {"host": host, "count": len(jobs), "jobs": jobs,
+            "limits": {"retention_days": guard.job_retention_days, "max_concurrent": guard.job_max_concurrent}}
+
+
 def _tool_session_reset(host: str) -> dict:
     POOL.close(host, reset_cwd=True)
     return {"host": host, "reset": True, "cwd": POOL.cwd(host)}
@@ -1175,6 +1352,8 @@ def build_server():
             "cwd 由服务端按主机记忆，可用参数覆盖；max_duration 传多大就用多大。"
             "elevate=true 以 root 跑这一条（凭据里该主机须 elevate:true）——服务端用 sudo -S 并把口令写进"
             "channel stdin，口令不进命令行、不进审计、不进远端 history；提权命令一律查清单。"
+            "detach=true 把这条命令丢到远端后台跑并立刻返回 job_id（用 job_status 取状态与输出、job_kill 停掉）"
+            "——状态存在远端 ~/.sshmcp-jobs/，服务重启/断连/换会话都不丢；v1 与 elevate 互斥。"
         ),
     )
     async def _exec(
@@ -1185,11 +1364,12 @@ def build_server():
         max_duration: float | None = None,
         force: bool = False,
         elevate: bool = False,
+        detach: bool = False,
     ) -> dict:
         import anyio
 
         return await anyio.to_thread.run_sync(
-            lambda: _tool_exec(host, command, cwd, idle_timeout, max_duration, force, elevate)
+            lambda: _tool_exec(host, command, cwd, idle_timeout, max_duration, force, elevate, detach)
         )
 
     @server.tool(
@@ -1291,6 +1471,43 @@ def build_server():
         limit: int = 16384,
     ) -> dict:
         return _tool_read_output(output_id, stream, mode, start, end, pattern, limit)
+
+    @server.tool(
+        name="job_status",
+        description=(
+            "读远端后台任务（exec detach=true 起的）的状态与输出增量。"
+            "不给 offset 就回最后 max_bytes 字节；给了 offset 就从该字节读，返回值里的 offset_next 供下次只取新增部分。"
+            "state：running/exited/killed/lost/missing。输出在远端 out 文件里，不占本机 output/ 配额。"
+        ),
+    )
+    async def _job_status(host: str, job_id: str, offset: int | None = None, max_bytes: int = 65536) -> dict:
+        import anyio
+
+        return await anyio.to_thread.run_sync(lambda: _tool_job_status(host, job_id, offset, max_bytes))
+
+    @server.tool(
+        name="job_kill",
+        description=(
+            "停掉一个远端后台任务：先对整个进程组 SIGTERM，5 秒不退再 SIGKILL，外加子进程树兜底。"
+            "杀前核对进程命令行里确实是这个 job id（防 PID 复用误杀）；已结束的任务只会返回 not_running。"
+        ),
+    )
+    async def _job_kill(host: str, job_id: str) -> dict:
+        import anyio
+
+        return await anyio.to_thread.run_sync(lambda: _tool_job_kill(host, job_id))
+
+    @server.tool(
+        name="job_list",
+        description=(
+            "列远端最近的后台任务及状态（running/exited/killed/lost），用于找孤儿任务与清理。"
+            "保留期与并发上限取 policy.json 的 defaults.job_retention_days / job_max_concurrent。"
+        ),
+    )
+    async def _job_list(host: str, limit: int = 20) -> dict:
+        import anyio
+
+        return await anyio.to_thread.run_sync(lambda: _tool_job_list(host, limit))
 
     return server
 

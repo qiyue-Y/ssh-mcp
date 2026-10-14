@@ -66,6 +66,9 @@ class GuardConfig:
     max_transfer_bytes: int = 4 * 1024**3
     xfer_chunk_bytes: int = 1024 * 1024
     xfer_dir: str = ""
+    # 后台任务（job）：保留期与并发上限
+    job_retention_days: int = 7
+    job_max_concurrent: int = 8
 
 
 class GuardSyntaxError(ValueError):
@@ -286,6 +289,8 @@ def load_guard(data: dict | None) -> GuardConfig:
         max_transfer_bytes=int(defaults.get("max_transfer_bytes", 4 * 1024**3)),
         xfer_chunk_bytes=int(defaults.get("xfer_chunk_bytes", 1024 * 1024)),
         xfer_dir=str(defaults.get("xfer_dir") or ""),
+        job_retention_days=int(defaults.get("job_retention_days", 7)),
+        job_max_concurrent=int(defaults.get("job_max_concurrent", 8)),
         kill_prefixes=parse_prefixes((data or {}).get("killlist") or []),
         guarded_hosts=frozenset((data or {}).get("guarded_hosts") or []),
     )

@@ -229,5 +229,59 @@ class PartNaming(unittest.TestCase):
         self.assertEqual(X.md5_of_file(str(tmp), chunk=CH), hashlib.md5(self_bytes).hexdigest())
 
 
+class UnknownSizePull(unittest.TestCase):
+    """st_size 不可信的两类现场：/proc 报 0（现在按长度未知读到 EOF）、/sys 报 4096 实际更短。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="xfer-unknown-"))
+        self.sftp = FakeSFTP()
+
+    def _force_stat(self, path: str, size: int):
+        real = self.sftp.stat
+
+        def stat(p):
+            return type("S", (), {"st_size": size})() if p == path else real(p)
+
+        self.sftp.stat = stat
+
+    def test_zero_size_streams_to_eof(self):
+        content = b"processor : 0\nmodel name : x\n" * 40
+        self.sftp.files["/r/proc"] = bytearray(content)
+        self._force_stat("/r/proc", 0)
+        part = self.tmp / "dst.sshmcp-part"
+        tr = X.pull(self.sftp, "/r/proc", str(part), chunk=CH)
+        self.assertEqual(part.read_bytes(), content, "0 字节的伪文件要按 EOF 读全，不是落 0 字节")
+        self.assertEqual(tr.bytes, len(content))
+        self.assertEqual(tr.resumed_from, 0)
+
+    def test_zero_size_discards_stale_part(self):
+        self.sftp.files["/r/proc"] = bytearray(b"new content")
+        self._force_stat("/r/proc", 0)
+        part = self.tmp / "dst.sshmcp-part"
+        part.write_bytes(b"\xff" * (3 * CH))
+        tr = X.pull(self.sftp, "/r/proc", str(part), chunk=CH)
+        self.assertEqual(tr.resumed_from, 0, "长度未知就不续传")
+        self.assertEqual(part.read_bytes(), b"new content")
+
+    def test_zero_size_still_respects_total_limit(self):
+        self.sftp.files["/r/proc"] = bytearray(b"\x00" * (4 * CH))
+        self._force_stat("/r/proc", 0)
+        part = self.tmp / "p.part"
+        with self.assertRaises(X.TransferAborted):
+            X.pull(self.sftp, "/r/proc", str(part), chunk=CH, total_limit=2 * CH + 5)
+        self.assertLessEqual(len(part.read_bytes()), 2 * CH + 5, "上限按已写字节判")
+
+    def test_stat_larger_than_content_reports_actual_bytes(self):
+        """100 上实测：/sys 报 4096、内容 18 字节 —— bytes/chunks 必须是实际落盘量。"""
+        content = b"00:00:00:00:00:00\n"
+        self.sftp.files["/sys/x"] = bytearray(content)
+        self._force_stat("/sys/x", 4096)
+        part = self.tmp / "sys.part"
+        tr = X.pull(self.sftp, "/sys/x", str(part), chunk=CH)
+        self.assertEqual(tr.bytes, len(content))
+        self.assertEqual(tr.chunks, 1)
+        self.assertEqual(part.read_bytes(), content)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

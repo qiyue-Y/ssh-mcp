@@ -559,6 +559,154 @@ class KilllistWiring(unittest.TestCase):
         self.assertEqual(res["cwd_after"], "/tmp")
         self.assertEqual(M.POOL.cwd("admin"), "/tmp")
 
+    def test_cd_expr_keeps_tilde_out_of_the_quotes(self):
+        """`~` 裹进引号就成了字面量（实测 cd ~ 必失败），头留在引号外，剩余部分照旧保护。"""
+        self.assertEqual(M._cd_expr("~"), "~")
+        self.assertEqual(M._cd_expr("~/proj"), "~/proj")
+        self.assertEqual(M._cd_expr("~root/x"), "~root/x")
+        self.assertEqual(M._cd_expr("~/a b"), "~/'a b'")
+        self.assertEqual(M._cd_expr("/var/log"), "/var/log")
+        self.assertEqual(M._cd_expr("/a b"), "'/a b'")
+
+    def test_cd_probe_forms(self):
+        """探活串：`cd ~` 不许出现 '~'，带空格的目标保住引号，光一个 cd 当回 home。"""
+        write_hosts({"admin": dict(ROOT_PINNED)})
+        seen: list[str] = []
+
+        def pwd_run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False):
+            seen.append(command)
+            spill.write("out", b"/home/qy\n")
+            spill.close()
+            return M.RunResult(exit_code=0, stdout=spill.inline("out"), stderr="", truncated=False, timed_out=None, output_id=spill.run_id, stats=spill.stats())
+
+        with mock.patch.object(M, "run_command", pwd_run):
+            M.execute("admin", "cd ~")
+            M.execute("admin", "cd '~/a b'")
+            M.execute("admin", "cd")
+        self.assertEqual(seen, ["cd ~ && pwd", "cd ~/'a b' && pwd", "cd ~ && pwd"])
+        self.assertEqual(M.POOL.cwd("admin"), "/home/qy")
+
+
+class _FakeHandle:
+    def __init__(self, buf: bytes):
+        self.buf = buf
+        self.pos = 0
+
+    def seek(self, n):
+        self.pos = n
+
+    def read(self, n=-1):
+        out = self.buf[self.pos : self.pos + n] if n and n > 0 else self.buf[self.pos :]
+        self.pos += len(out)
+        return out
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FakeSftpRead:
+    """只够 job_status 读 out 用：normalize + open。"""
+
+    def __init__(self, content: bytes):
+        self.content = content
+
+    def normalize(self, path):
+        return "/home/qy"
+
+    def open(self, path, mode="rb"):
+        return _FakeHandle(self.content)
+
+    def close(self):
+        pass
+
+
+class DetachWiring(unittest.TestCase):
+    """exec(detach=true)：拦/放行与普通 exec 同源（过清单、吃 force），elevate 显式互斥。"""
+
+    @staticmethod
+    def _run_with(out: bytes):
+        def _run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False):
+            spill.write("out", out)
+            spill.close()
+            return M.RunResult(exit_code=0, stdout=out.decode(), stderr="", truncated=False,
+                               timed_out=None, output_id=spill.run_id, stats=spill.stats())
+
+        return _run
+
+    def test_elevate_is_refused(self):
+        write_hosts({"100": dict(PINNED)})
+        res = M.execute("100", "sleep 999", elevate=True, detach=True)
+        self.assertTrue(res.get("blocked"))
+        self.assertEqual(res.get("reason"), "elevate_detach_unsupported")
+
+    def test_killlist_still_applies(self):
+        write_hosts({"admin": dict(ROOT_PINNED)})
+        res = M.execute("admin", "mkfs.ext4 /dev/sda1", detach=True)
+        self.assertTrue(res.get("blocked"))
+        self.assertEqual(res.get("reason"), "killlisted")
+
+    def test_started_returns_job_id_and_quotes_command(self):
+        write_hosts({"admin": dict(ROOT_PINNED)})
+        seen = []
+
+        def _run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False):
+            seen.append(command)
+            spill.write("out", b"STARTED 4242\n")
+            spill.close()
+            return M.RunResult(exit_code=0, stdout="STARTED 4242\n", stderr="", truncated=False,
+                               timed_out=None, output_id=spill.run_id, stats=spill.stats())
+
+        with mock.patch.object(M, "run_command", _run):
+            res = M.execute("admin", "mkfs.ext4 /dev/sda1", detach=True, force=True)
+        self.assertTrue(res["job_id"].startswith("job-"))
+        self.assertEqual(res["pid"], 4242)
+        self.assertEqual(res["state"], "running")
+        self.assertEqual(res.get("forced_rule"), "forced")
+        self.assertEqual(len(seen), 1)
+        self.assertIn("nohup", seen[0])
+        self.assertIn(res["job_id"], seen[0])
+        self.assertIn("printf '%s\\n' 'mkfs.ext4 /dev/sda1'", seen[0], "命令必须以整体引号进脚本")
+
+    def test_busy_refusal(self):
+        write_hosts({"100": dict(PINNED)})
+        with mock.patch.object(M, "run_command", self._run_with(b"BUSY 8\n")):
+            res = M.execute("100", "sleep 1", detach=True)
+        self.assertTrue(res.get("blocked"))
+        self.assertEqual(res.get("reason"), "too_many_jobs")
+        self.assertEqual(res.get("busy"), 8)
+
+    def test_job_tools_reject_bad_id_without_connecting(self):
+        write_hosts({"100": dict(PINNED)})
+        self.assertEqual(M._tool_job_status("100", "job-x").get("error"), "invalid_job_id")
+        self.assertEqual(M._tool_job_kill("100", "../../etc").get("error"), "invalid_job_id")
+
+    def test_job_kill_parses_result(self):
+        write_hosts({"100": dict(PINNED)})
+        with mock.patch.object(M, "run_command", self._run_with(b"result=terminated\n")):
+            res = M._tool_job_kill("100", "job-1a2b3c4d-abcd")
+        self.assertEqual(res["result"], "terminated")
+
+    def test_job_status_merges_state_and_offset_slice(self):
+        write_hosts({"100": dict(PINNED)})
+        state = b"state=running\ncode=\npid=9\nstarted=100\nnow=130\nout_bytes=10\ncommand=echo hi\n"
+        sftp = _FakeSftpRead(b"0123456789")
+        with mock.patch.object(M, "run_command", self._run_with(state)), mock.patch.object(M, "_sftp_of", lambda *a, **k: sftp):
+            res = M._tool_job_status("100", "job-1a2b3c4d-abcd", offset=4, max_bytes=3)
+        self.assertEqual(res["state"], "running")
+        self.assertEqual(res["text"], "456")
+        self.assertEqual(res["offset_next"], 7)
+        self.assertEqual(res["out_bytes"], 10)
+        self.assertEqual(res["elapsed_s"], 30)
+        self.assertTrue(res["truncated"])
+        with mock.patch.object(M, "run_command", self._run_with(state)), mock.patch.object(M, "_sftp_of", lambda *a, **k: sftp):
+            tail = M._tool_job_status("100", "job-1a2b3c4d-abcd", max_bytes=4)
+        self.assertEqual(tail["text"], "6789")
+        self.assertEqual(tail["offset_next"], 10)
+        self.assertFalse(tail["truncated"])
+
 
 class SftpStub:
     """只实现传输用到的那几个方法。opened 计数用来证明「被拦时根本没连」。"""

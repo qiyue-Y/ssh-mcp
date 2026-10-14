@@ -72,8 +72,8 @@ def _read_blocks(fh, chunk: int, deadline: float | None):
         yield block
 
 
-def _write_blocks(fh, src, chunk: int, deadline: float | None, total: int, sent_cb=None):
-    """逐片写并逐片 flush。
+def _write_blocks(fh, src, chunk: int, deadline: float | None, total: int | None, sent_cb=None, limit: int | None = None):
+    """逐片写并逐片 flush。`total=None` 表示长度未知：读到 EOF 为止。
 
     为什么不"只 flush 收尾"：pipelined 写是异步入队的，中途抛异常或提前关通道时，
     已入队的写还会继续落服务端 —— 于是 part 的实际字节数在我们读完之后还会漂移，
@@ -81,12 +81,14 @@ def _write_blocks(fh, src, chunk: int, deadline: float | None, total: int, sent_
     每片 flush 实测同样 10.1 MB/s（不 flush 反而只有 5.9），既确定又不亏速度。
     """
     sent = 0
-    while sent < total:
+    while total is None or sent < total:
         if deadline is not None and time.monotonic() >= deadline:
             raise TransferAborted("传输超时")
-        block = src.read(min(chunk, total - sent))
+        block = src.read(chunk if total is None else min(chunk, total - sent))
         if not block:
             break
+        if limit is not None and sent + len(block) > limit:
+            raise TransferAborted(f"已写 {sent} 字节，再加这一片会超过上限 {limit}")
         fh.write(block)
         fh.flush()
         sent += len(block)
@@ -128,30 +130,42 @@ def push(sftp, local: str, part: str, *, chunk: int = DEFAULT_CHUNK, deadline: f
 
 def pull(sftp, remote: str, part: str, *, chunk: int = DEFAULT_CHUNK, deadline: float | None = None,
          total_limit: int | None = None) -> Transfer:
-    """远端 -> 本机 part。方向相反，续传逻辑对称。"""
+    """远端 -> 本机 part。方向相反，续传逻辑对称。
+
+    `st_size == 0` 按"长度未知"处理：读到 EOF 为止、不续传 —— `/proc` 这类伪文件
+    大小报 0，真空文件走同一条路结果也对（读到 EOF 就没有内容）。此时 total_limit
+    改为按已写字节判定，不放松上限。返回值 bytes/chunks 取实际落盘量（stat 说的
+    不一定对：/sys 实测报 4096、实际只有 18 字节）。
+    """
     size = sftp.stat(remote).st_size
     if total_limit is not None and size > total_limit:
         raise TransferAborted(f"远端文件 {size} 字节超过上限 {total_limit}")
 
     have = _local_size(part)
-    _, base = resume_from(have, chunk)
-    if base > size:
-        # 远端文件被换小/重新生成过：本机这份旧 part 的前缀已经不对应任何有效状态
-        base = 0
-        have = 0
-    if have > base:
-        with open(part, "r+b") as fh:
-            fh.truncate(base)
+    if size == 0:
+        base = 0  # 长度未知：旧 part 的前缀无法证明对应什么，整篇重读（open 走 "wb" 截断）
+    else:
+        _, base = resume_from(have, chunk)
+        if base > size:
+            # 远端文件被换小/重新生成过：本机这份旧 part 的前缀已经不对应任何有效状态
+            base = 0
+            have = 0
+        if have > base:
+            with open(part, "r+b") as fh:
+                fh.truncate(base)
 
     start = time.monotonic()
     with open(part, "ab" if base else "wb") as dst, sftp.open(remote, "rb") as src:
         # 先定位再预取：续传点之后的区间才是我们要的，先 prefetch 会预读已拥有的那一段
-        src.seek(base)
-        src.prefetch()
-        _write_blocks(dst, src, chunk, deadline, size - base)
+        if base:
+            src.seek(base)
+            src.prefetch()
+        written = _write_blocks(dst, src, chunk, deadline, None if size == 0 else size - base,
+                                limit=total_limit if size == 0 else None)
+    got = base + written
     return Transfer(
-        bytes=size,
-        chunks=(size + chunk - 1) // chunk,
+        bytes=got,
+        chunks=(got + chunk - 1) // chunk,
         resumed_from=base,
         seconds=time.monotonic() - start,
     )
