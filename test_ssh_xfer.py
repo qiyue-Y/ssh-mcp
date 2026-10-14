@@ -20,6 +20,9 @@ import ssh_xfer as X
 
 
 class FakeHandle:
+    # 对齐 paramiko：类常量、实例可覆盖（ssh_xfer 会在打开后覆盖它）
+    MAX_REQUEST_SIZE = 32768
+
     def __init__(self, buf: bytearray, mode: str, owner: "FakeSFTP | None" = None):
         self.buf = buf
         self.mode = mode
@@ -32,6 +35,7 @@ class FakeHandle:
 
     def prefetch(self, file_size=None):
         self.prefetched = True
+        self.prefetch_size = file_size
 
     def flush(self):
         if self.owner is not None:
@@ -173,6 +177,51 @@ class PushPull(unittest.TestCase):
         self.sftp.file = spy
         X.push(self.sftp, str(self.local), "/r/part", chunk=CH)
         self.assertTrue(seen.get("pipelined"), "不开 pipelined 实测慢一半（5.2 vs 10.1 MB/s）")
+
+    def test_request_size_is_raised_on_push(self):
+        """32KB 请求同场配对实测慢一档（15/16、中位 +5%）：push 打开的句柄必须放大单条请求。"""
+        captured = []
+        real_file = self.sftp.file
+
+        def spy(path, mode="r", bufsize=-1):
+            h = real_file(path, mode, bufsize)
+            captured.append(h)
+            return h
+
+        self.sftp.file = spy
+        X.push(self.sftp, str(self.local), "/r/part", chunk=CH)
+        self.assertEqual(captured[-1].MAX_REQUEST_SIZE, X.REQUEST_SIZE)
+
+    def test_request_size_is_raised_on_pull(self):
+        """方向对称：pull 的远端句柄同样放大，否则下载仍是 32KB 一停。"""
+        self.sftp.files["/r/big.bin"] = bytearray(self.data)
+        captured = []
+        real_open = self.sftp.open
+
+        def spy(path, mode="rb"):
+            h = real_open(path, mode)
+            captured.append(h)
+            return h
+
+        self.sftp.open = spy
+        X.pull(self.sftp, "/r/big.bin", str(self.tmp / "dst.bin"), chunk=CH)
+        self.assertEqual(captured[-1].MAX_REQUEST_SIZE, X.REQUEST_SIZE)
+
+    def test_fresh_pull_also_prefetches(self):
+        """全新下载也要预取（实测 256MiB：4.5 → 36.7 MiB/s）；传整文件大小，避免内部 stat。"""
+        self.sftp.files["/r/big.bin"] = bytearray(self.data)
+        captured = []
+        real_open = self.sftp.open
+
+        def spy(path, mode="rb"):
+            h = real_open(path, mode)
+            captured.append(h)
+            return h
+
+        self.sftp.open = spy
+        X.pull(self.sftp, "/r/big.bin", str(self.tmp / "dst.bin"), chunk=CH)
+        self.assertTrue(getattr(captured[-1], "prefetched", False), "全新下载没走预取")
+        self.assertEqual(captured[-1].prefetch_size, len(self.data), "预取要给到整文件大小")
 
     def test_stale_part_larger_than_source_is_discarded(self):
         """源文件被重新生成过（变小了）：旧 part 前缀已不对应任何有效状态，必须从头来，

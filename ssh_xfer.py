@@ -7,6 +7,16 @@
     pipelined 不逐片 flush 5.9 —— 只有 **pipelined + 每片 flush** 才拿到 10.1 MB/s，
     与 `sftp.put` 持平。逐片 flush 不是代价，是既快又让 part 状态确定的唯一组合。
 
+单条请求尺寸（2026-10-14 实测）：paramiko 默认把一次写切成 32KB 的 SFTP 请求
+（`SFTPFile.MAX_REQUEST_SIZE`），这里在打开的句柄上实例级放大到 128KB（REQUEST_SIZE）。
+256MiB 同场配对实测：64/128KB 比 32KB 快，16 对里 15 对为正、中位 +5%（~7.9 → ~8.3 MiB/s），
+64 与 128 无差（空闲高速时段三者无差——paramiko 另有 ~21 MiB/s 的客户端上限）。
+红线：单条 262144B 的请求会让服务端 sftp-server 退出、通道当场死
+（255KB 可过）——128KB 离红线留余量。
+
+下载预取（2026-10-14 实测）：拉取方向对全新下载也调用 prefetch（此前只续传时预取）：
+256MiB 实测 4.5 → 36.7 MiB/s，同场快过 OpenSSH scp 的下载（~18 MiB/s）。
+
 part 文件路径由 (方向, 源, 目标) 定名且不带随机后缀 —— 这是"下次调用能接着传"的前提。
 """
 
@@ -20,6 +30,8 @@ from dataclasses import dataclass
 # 1MB：实测与 sftp.put 同速的最优分片，同时给续传足够细的粒度
 DEFAULT_CHUNK = 1024 * 1024
 PART_SUFFIX = ".sshmcp-part"
+# 单条 SFTP 请求上限：paramiko 默认 32KB 的实例级覆盖，理由见文件头实测段
+REQUEST_SIZE = 128 * 1024
 
 
 @dataclass
@@ -117,6 +129,8 @@ def push(sftp, local: str, part: str, *, chunk: int = DEFAULT_CHUNK, deadline: f
     with open(local, "rb") as src, sftp.file(part, mode) as fh:
         if hasattr(fh, "set_pipelined"):
             fh.set_pipelined(True)
+        if hasattr(fh, "MAX_REQUEST_SIZE"):
+            fh.MAX_REQUEST_SIZE = REQUEST_SIZE
         fh.seek(base)
         src.seek(base)
         sent = _write_blocks(fh, src, chunk, deadline, size - base)
@@ -156,10 +170,14 @@ def pull(sftp, remote: str, part: str, *, chunk: int = DEFAULT_CHUNK, deadline: 
 
     start = time.monotonic()
     with open(part, "ab" if base else "wb") as dst, sftp.open(remote, "rb") as src:
-        # 先定位再预取：续传点之后的区间才是我们要的，先 prefetch 会预读已拥有的那一段
+        if hasattr(src, "MAX_REQUEST_SIZE"):
+            src.MAX_REQUEST_SIZE = REQUEST_SIZE
         if base:
-            src.seek(base)
-            src.prefetch()
+            src.seek(base)  # 先定位：续传点之后的区间才是要读的
+        if size > 0:
+            # 全新下载与续传一样走预取（异步连发读），不走同步逐块读。
+            # 实测 256MiB：4.5 → 36.7 MiB/s（2026-10-14）；显式传 size 免去 paramiko 内部 stat
+            src.prefetch(size)
         written = _write_blocks(dst, src, chunk, deadline, None if size == 0 else size - base,
                                 limit=total_limit if size == 0 else None)
     got = base + written
