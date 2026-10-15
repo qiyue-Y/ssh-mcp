@@ -105,6 +105,18 @@ class BenignCommandsPass(AssertBlockedMixin, unittest.TestCase):
     def test_innocuous_chmod_and_fdisk_reads(self):
         self.assertPasses("chmod 777 /tmp/x", "fdisk -l", "df -h")
 
+    def test_read_redirects_are_not_writes(self):
+        """`<` 是读重定向、`<<<` 是 here-string，都不写文件——曾把 `wc -l < 密钥文件` 误拦（2026-10-14）。"""
+        self.assertPasses(
+            "wc -l < /home/qy/.ssh/authorized_keys",
+            "grep x < /etc/shadow",
+            "wc -l < /etc/passwd",
+        )
+
+    def test_write_redirects_to_the_same_files_still_block(self):
+        # 反向对照：同一个文件走写形态仍然拦，别把「读的放行」写成「写的也放行」
+        self.assertBlocked("tee /etc/shadow", "cat x > /etc/shadow", "echo x <> /etc/passwd")
+
     def test_fd_dup_is_not_a_write(self):
         self.assertPasses("make -j8 2>&1 | tee /tmp/build.log", "grep x /etc/shadow 2>/dev/null")
 

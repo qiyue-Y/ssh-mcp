@@ -136,6 +136,12 @@ def build_kill_script(job_id: str) -> str:
         '    echo "result=not_running"\n'
         '    echo "state=$state"\n'
         '    if [ -n "$code" ]; then echo "code=$code"; fi\n'
+        '    if [ "$state" = lost ]; then\n'
+        # 失联任务（机器重启、被 kill -9）两个标记都没有：补写 killed 完成回收，
+        # 否则它永远占着并发名额、也永远不会被清扫（清扫只看标记的龄期）
+        '      touch "$J/killed"\n'
+        '      echo "reaped=1"\n'
+        "    fi\n"
         "  else\n"
         '    kill -s TERM -- "-$pid" 2>/dev/null; kill_tree "$pid" TERM\n'
         '    i=0; while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 5 ]; do sleep 1; i=$((i+1)); done\n'

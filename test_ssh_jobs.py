@@ -85,6 +85,12 @@ class OtherScripts(unittest.TestCase):
         self.assertIn('touch "$J/killed"', s)
         self.assertIn("kill_tree", s)
 
+    def test_kill_script_reaps_lost_jobs(self):
+        # 失联任务两个标记都没有，不清扫也不释放并发名额：job_kill 见到 lost 要补 killed
+        s = J.build_kill_script(JID)
+        self.assertIn('if [ "$state" = lost ]; then', s)
+        self.assertIn('echo "reaped=1"', s)
+
     def test_list_rows_are_pipe_delimited(self):
         s = J.build_list_script(20)
         self.assertIn('echo "$ID|$state|$code|', s)

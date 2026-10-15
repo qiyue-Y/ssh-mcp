@@ -736,18 +736,27 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
     return _ok(alias, command, res, start_cwd, end_cwd, hit.rule if hit else None, elevate, cred.elevate_user or "root")
 
 
+ECHO_LIMIT = 200  # 回显给调用方的命令原文上限；全文始终在审计里，回显只是给对照用
+
+
+def _echo(command: str) -> str:
+    if len(command) <= ECHO_LIMIT:
+        return command
+    return f"{command[:ECHO_LIMIT]}…[截断，全文 {len(command)} 字符，见 audit_tail]"
+
+
 def _block(alias: str, command: str, reason: str, rule: str, hint: str) -> dict:
     try:  # 被拒也要留痕，但拒本身不需要 fail closed
         audit({"host": alias, "command": command, "event": "blocked", "reason": reason, "rule": rule})
     except OSError as exc:
         log(f"审计写入失败：{exc}")
-    return {"host": alias, "command": command, "blocked": True, "reason": reason, "rule": rule, "hint": hint}
+    return {"host": alias, "command": _echo(command), "blocked": True, "reason": reason, "rule": rule, "hint": hint}
 
 
 def _ok(alias, command, res: RunResult, cwd_before, cwd_after, forced_rule: str | None = None, elevate: bool = False, ran_as: str = "root") -> dict:
     payload = {
         "host": alias,
-        "command": command,
+        "command": _echo(command),
         "exit_code": res.exit_code,
         "stdout": res.stdout,
         "stderr": res.stderr,
@@ -779,7 +788,7 @@ def _ok(alias, command, res: RunResult, cwd_before, cwd_after, forced_rule: str 
 # --------------------------------------------------------------------------------------
 
 
-def _tool_list_hosts() -> dict:
+def _tool_list_hosts(brief: bool = False) -> dict:
     guard = GUARD.get()
     creds = HOSTS.get()
     hosts = []
@@ -817,6 +826,16 @@ def _tool_list_hosts() -> dict:
                 },
             }
         )
+    if brief:
+        for h in hosts:
+            h.pop("purpose", None)
+            h.pop("limits", None)
+        return {
+            "hosts": hosts,
+            "guarded_hosts": sorted(guard.guarded_hosts),
+            "unpinned": [a for a in sorted(creds) if not effective_pin(a, creds[a])[0]],
+            "note": "brief 模式：每台的 limits 与全量 killlist 没带，要全量用 list_hosts(brief=false)",
+        }
     return {
         "hosts": hosts,
         "killlist": [p.raw for p in guard.kill_prefixes],
@@ -1182,13 +1201,13 @@ def _start_job(alias: str, command: str, cred: HostCred, pin: str, guard, start_
                    "job_id": job_id, "reason": parsed["result"], "stderr": res.stderr[:300]})
         except OSError:
             pass
-        return {"host": alias, "command": command, "job_id": job_id, "detached": True, "state": "unknown",
+        return {"host": alias, "command": _echo(command), "job_id": job_id, "detached": True, "state": "unknown",
                 "error": "job_not_started", "reason": parsed["result"], "exit_code": res.exit_code,
                 "stdout": res.stdout[:300], "stderr": res.stderr[:300],
                 "hint": "远端没写出 pid 文件：看 stdout/stderr（NOPID 多为目录不可写或缺 setsid/nohup）"}
     audit({"host": alias, "command": command, "event": "job_started", "rule": rule, "job_id": job_id,
            "pid": parsed.get("pid"), "dir": directory or "~"})
-    out = {"host": alias, "command": command, "job_id": job_id, "detached": True, "state": "running",
+    out = {"host": alias, "command": _echo(command), "job_id": job_id, "detached": True, "state": "running",
            "pid": parsed.get("pid"), "cwd": start_cwd,
            "next": f"job_status(host='{alias}', job_id='{job_id}') 看状态与输出；job_kill 停它"}
     if rule == "forced":
@@ -1276,7 +1295,10 @@ def _tool_job_kill(host: str, job_id: str) -> dict:
         out["state"] = kv["state"]
     if (kv.get("code") or "").isdigit():
         out["exit_code"] = int(kv["code"])
-    if result == "missing":
+    if kv.get("reaped"):
+        out["reaped"] = True
+        out["hint"] = "任务已失联（进程不在、也没有退出标记）：已补写 killed 标记完成回收——不再占并发名额，7 天后自动清"
+    elif result == "missing":
         out["hint"] = "没有这个任务（从未启动过，或已过保留期被清）"
     elif result == "not_running":
         out["hint"] = "任务已经不在跑（看 state/exit_code），没有可停的东西"
@@ -1339,9 +1361,9 @@ def build_server():
     server_class = _import_highlevel_server()
     server = server_class("ssh-mcp")
 
-    @server.tool(name="list_hosts", description="列出凭据文件里的主机、指纹固定状态、是否受 killlist 保护及其原因、限额。不含任何密码。")
-    async def _list_hosts() -> dict:
-        return _tool_list_hosts()
+    @server.tool(name="list_hosts", description="列出凭据文件里的主机、指纹固定状态、是否受 killlist 保护及其原因。brief=true 只回短字段（不带每台的 limits 与全量 killlist），省上下文。不含任何密码。")
+    async def _list_hosts(brief: bool = False) -> dict:
+        return _tool_list_hosts(brief)
 
     @server.tool(
         name="exec",

@@ -689,6 +689,14 @@ class DetachWiring(unittest.TestCase):
             res = M._tool_job_kill("100", "job-1a2b3c4d-abcd")
         self.assertEqual(res["result"], "terminated")
 
+    def test_job_kill_reaps_lost_job(self):
+        write_hosts({"100": dict(PINNED)})
+        with mock.patch.object(M, "run_command", self._run_with(b"result=not_running\nstate=lost\nreaped=1\n")):
+            res = M._tool_job_kill("100", "job-1a2b3c4d-abcd")
+        self.assertEqual(res["state"], "lost")
+        self.assertTrue(res["reaped"])
+        self.assertIn("回收", res["hint"])
+
     def test_job_status_merges_state_and_offset_slice(self):
         write_hosts({"100": dict(PINNED)})
         state = b"state=running\ncode=\npid=9\nstarted=100\nnow=130\nout_bytes=10\ncommand=echo hi\n"
@@ -706,6 +714,41 @@ class DetachWiring(unittest.TestCase):
         self.assertEqual(tail["text"], "6789")
         self.assertEqual(tail["offset_next"], 10)
         self.assertFalse(tail["truncated"])
+
+
+class ResponseSize(unittest.TestCase):
+    """回显治理（2026-10-14）：exec 命令回显超长截尾；list_hosts 有 brief 模式。"""
+
+    def test_long_command_echo_is_truncated(self):
+        write_hosts({"100": dict(PINNED)})
+        long_cmd = "echo " + "x" * 400
+        with mock.patch.object(M, "run_command", fake_run(0)):
+            res = M.execute("100", long_cmd)
+        self.assertIn("截断", res["command"])
+        self.assertLess(len(res["command"]), len(long_cmd))
+        self.assertTrue(res["command"].startswith("echo x"))
+
+    def test_short_command_echo_is_untouched(self):
+        write_hosts({"100": dict(PINNED)})
+        with mock.patch.object(M, "run_command", fake_run(0)):
+            res = M.execute("100", "uptime")
+        self.assertEqual(res["command"], "uptime")
+
+    def test_long_command_blocked_response_is_truncated_too(self):
+        write_hosts({"admin": dict(ROOT_PINNED)})
+        res = M.execute("admin", "mkfs.ext4 /dev/sda1 " + "y" * 400)
+        self.assertTrue(res.get("blocked"))
+        self.assertIn("截断", res["command"])
+
+    def test_list_hosts_brief_drops_big_blocks(self):
+        write_hosts({"100": dict(PINNED)})
+        full = M._tool_list_hosts()
+        brief = M._tool_list_hosts(brief=True)
+        self.assertIn("limits", full["hosts"][0])
+        self.assertIn("killlist", full)
+        self.assertNotIn("limits", brief["hosts"][0])
+        self.assertNotIn("killlist", brief)
+        self.assertLess(len(json.dumps(brief, ensure_ascii=False)), len(json.dumps(full, ensure_ascii=False)))
 
 
 class SftpStub:

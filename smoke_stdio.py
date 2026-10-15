@@ -106,6 +106,8 @@ def main() -> int:
         for p in ("offset", "max_bytes"):
             if p not in schemas.get("job_status", {}):
                 failures.append(f"job_status 缺 {p} 参数")
+        if "brief" not in schemas.get("list_hosts", {}):
+            failures.append("list_hosts 缺 brief 参数")
         if "trust" not in schemas.get("pin_hostkey", {}):
             failures.append("pin_hostkey 缺 trust 参数")
         for name, params in (("put_file", ("overwrite", "force", "elevate", "restart", "mode")),

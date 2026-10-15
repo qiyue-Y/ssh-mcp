@@ -28,6 +28,8 @@
 
 ### 2026-10-13 · `get_file` 读 `st_size <= 0` 的文件拿不到内容（P2，提权路径反倒能读）
 
+**已实现（2026-10-14，ab160ef）**：pull 按「长度未知」读到 EOF、bytes/chunks 报实际落盘量、total_limit 按已写字节判、st_size=0 不续传；get_file 对 st_size=0 跳过二次 md5（`md5_check: skipped_st_size_0`）、FIFO 直接拒（会挂住等写者）。真机：/proc/cpuinfo 由 0 字节 → 48142 字节 verified；/sys 的 bytes 虚报 → 实际值（18）。
+
 - **现状与痛点**：`ssh_xfer.py:132` 用 `sftp.stat(remote).st_size` 规划要搬多少字节，`ssh_xfer.py:84`（`_write_blocks` 里）的写循环条件是 `while sent < total`。`/proc/*` 这类伪文件的 `st_size` 是 **0**，于是 `total = size - base = 0`，循环一次都不进，**落盘 0 字节**。随后 `ssh_mcp.py:1039-1044` 比对两侧 md5：远端算的是真实内容哈希、本地是空文件哈希 → 报 `md5_match: false`。所以这不是"静默产出错数据"（我一开始这么判断，读了校验环节才推翻），而是**永远抓不到、且报错原因指向错方向**。
 - **`/sys` 不在受害面里（2026-10-14 补测）**：`/sys/class/net/lo/address`、`/sys/kernel/vmcoreinfo` 的 `st_size` 实测是 **4096** 不是 0；读到内容尾遇 EOF 会提前停，实测落盘 18 字节、`md5_match:true`，能读。只是同一次返回里 `bytes:4096`、`chunks:1` 是按 stat **虚报**的（实际 18 字节）——同属"拿 st_size 当真相"这一个根因。
 - **反差值得单独记**：`elevate=true` 路径先把远端内容 `cat` 进一个暂存文件（`ssh_mcp.py:1005-1014`），暂存的是普通文件、有真实大小，于是**提权读得到、普通账号读不到**。使用者很容易误判成权限不足而不是实现缺陷。
@@ -40,6 +42,8 @@
 - **顺带撞出的第二个问题**：失败时给的 hint 是「md5 不符，part 已保留：重调同一参数从缺口续传」——但这里**没有缺口可续**，重调只会再来一次 0 字节。对这类文件，续传提示本身就是误导，应改说"该远端路径无固定大小，建议直接执行 `cat`（或走 elevate 路径）"。
 
 ### 2026-10-11 · M2 `detach` / `job_log` 接口草案（参考实现已逐行核过，可直接照抄形状）
+
+**已实现（2026-10-14，ab160ef）**：`exec(detach=true)` + `job_status`（状态与增量输出合并、offset/offset_next 游标）+ `job_kill` + `job_list`；状态存远端 `~/.sshmcp-jobs/`；按本草案的取舍落地——status/output 合并成一个、本地二级缓存不做、elevate 的 detach 不做、out 合并流。真机：75 秒任务跨过 60 秒客户端上限正常取回。失联任务的回收：`job_kill` 对 `lost` 补写 killed 标记（见 README「后台任务」）。
 
 下面「`max_duration` 放开后仍不够」那条的落地稿。参考对象是 `classfang/ssh-mcp-server` 的 job 实现，我把它源码读完了，**下列细节都在代码里核实存在，不是文档转述**：`src/utils/remote-jobs.ts:7-22`（目录布局）、`:40-47`（存活状态机与 PID 复用防护）、`:50-60`（wrapper 与原子写 exit）、`src/tools/jobs.ts:43/66/100/118`（四个 `registerTool`）。
 
@@ -71,6 +75,8 @@
 
 ### 2026-10-11 · `max_duration` 放开后仍不够：客户端侧有独立的调用硬上限，`detach` 是唯一解（给既有 P1 条目补论据）
 
+**已落地（2026-10-14，ab160ef）**：detach 已实现，长任务改走它。60 秒数字另有 8 个历史样本复核（客户端报错时刻 − 审计 intent 时刻 = 60.4–60.9s）；默认 `max_duration_s` 300s 未动。
+
 - **现状与痛点**：`ISSUES.md` 那条「静默长任务仍会被默认 300s 砍断」的正解写了「传个大 `max_duration` 就能跑完」。本次在 10.81.2.100 上实测到一个**服务端管不到的新事实**：从 Agent 侧发起调用时，MCP 客户端层自身约 60 秒就会中断调用，返回 `MCP tool invocation did not complete`，此时 `max_duration=900` 也没用。实测样本：远端跑 25s、55s 的命令能正常拿到结果；70s、120s、320s 的那几次全部丢结果（`npm i -g @deepseek-ai/dsh`、40×8s 轮询循环各撞一次），而远端进程照常在跑。
 - **建议做法**：把 M2 的 `detach` 优先级提上来，语义按「调用必须短」设计：`exec(detach=true)` 立刻返回 `job_id`，配 `job_status(job_id)` / `job_output(job_id, offset, tail_bytes, max_bytes)` / `job_kill(job_id)`。这样任何一次调用都远在 60 秒以内，长任务的完成与否由轮询判断，不再依赖"服务端超时够大"。
 - **预期收益**：一次性解决三类问题——长任务结果丢失、判活要靠手写 shell 轮询、以及 `idle_timeout` 按输出判活带来的误杀。
@@ -81,6 +87,8 @@
 
 ### 2026-10-11 · 缺判活原语，导致 Agent 手写轮询时踩到 `kill -0` 的权限假阴性
 
+**按方案 A 落地（2026-10-14）**：不新增工具，README 新增「判活」一节把规矩写死（跨用户判活带 elevate、`pgrep -x` 取 PID 且与 kill 分两条、长任务改 detach 轮询）。detach 也吃掉了本条的长任务那半边。
+
 - **现状与痛点**：工具没有"等进程结束/等文件出现"的语义，Agent 只能自己拼 shell。实测两个坑：① 用 qy 执行 `kill -0 <root 的 PID>` 判活返回 **EPERM**，看起来像"进程已退出"，据此误判了一次 apt 已结束（其实还在下载并持有 dpkg 锁）；② `pgrep -f '<模式>'` 会匹配到**承载这条 pgrep 自己的 `bash -c` 命令行**，导致轮询循环永不退出并虚报存活。
 - **建议做法**：给 `exec` 加 `wait_pid=<pid>` / `wait_file=<path>` 语义（内部用 `/proc` 判活并按 `idle_timeout` 心跳输出），或在 README「判活」一节写死：跨用户判活必须带 `elevate`，且 `pgrep -f` 的模式不得与自身命令行重合。
 - **预期收益**：消掉两类静默误判——这两类都不是报错，是**返回了错误的结论**，比报错更贵。
@@ -90,6 +98,8 @@
 
 ### 2026-10-11 · `list_hosts` 没有精简模式，`exec` 原样回显整条命令
 
+**已实现（2026-10-14）**：`list_hosts(brief=true)` 去掉每台的 limits 与全量 killlist；exec 回显超 200 字符截尾（标注"全文见 audit_tail"，审计里始终是全文）。第 3 条「输出默认只给摘要」不做——头+尾内联是报错可读性的地基（有实测理由）。
+
 - **现状与痛点**：`list_hosts` 每台机器都重复一整块 `limits` 与 `inline_output` 说明，加上全量 killlist，单次约 2.5KB；本次为查一个 `auth` 字段调了 3 次。`exec` 的响应把调用方发过去的命令**逐字回显**，本次约 25 条命令平均 700 字符，光回显约 17KB。粗估这轮调用返回的字节里 40–55% 是信封与回声，不是信息（量级估算，非精确计量）。
 - **建议做法**：`list_hosts(brief=true)` 或 `fields=` 只回别名/地址/auth/pin_source；把 `limits` 挪到单独工具或只在首次返回。`exec` 加 `echo_command`（默认 `false`，或超过 N 字符时截断）。stdout 超阈值时默认只回摘要 + `output_id`——`read_output` 已经存在，缺的是让它成为默认路径。
 - **预期收益**：长会话里 Agent 的上下文占用显著下降，同样任务能塞进更多轮次。
@@ -98,6 +108,8 @@
 - **实测支撑**：有（字节数是实测相加，比例是估算）。
 
 ### 2026-10-11 · 凭据从 password 切到 key 后，`elevate_password_from: "password"` 的语义要写明
+
+**已实现（2026-10-14）**：README 提权一节写明 `auth` 与 `elevate_password_from` 是两个独立字段，key 登录下后者照常有效（口令只喂 `sudo -S` 的 stdin）。
 
 - **现状与痛点**：100 改仅密钥登录后，`auth` 变成 `"key"`，但 `elevate` 仍靠登录口令工作（实测 `ran_as: root` 正常）。`list_hosts` 里 `elevate_password_from: "password"` 字面上像"仍用密码认证"，容易让人误判凭据配置没改过来——本次就因此多绕了一轮排查。
 - **建议做法**：在 README 或 `list_hosts` 输出里把两者区分清楚：登录认证方式（`auth`）与提权口令来源（`elevate_password_from`）是两个独立字段，后者在前者为 `key` 时依旧有效，因为口令只喂给 `sudo -S` 的 channel stdin。

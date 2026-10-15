@@ -47,6 +47,7 @@
 - **最小复现**：`exec(host="100", command="sleep 400", max_duration=5)` → `exit_code=-1`、`timed_out="duration"`。不传 `max_duration` 时是 300s。
 - **影响面**：不知道要传大时长的调用方仍会撞上默认 300s 被切。
 - **正解**：要么把 `defaults.max_duration_s` 提到 1800，要么实现原计划的 M2 `detach` + `job_log`（落盘层已就位，`job_log` 可直接复用 `output_store`）。本次没动默认值。
+- **2026-10-14 更新**：M2 detach 已实现（ab160ef，`exec(detach=true)` + `job_status`/`job_kill`/`job_list`）——长任务改走 detach，不再受单次调用时长限制；默认 `max_duration_s` 仍 300s（短任务不受影响，未动）。
 
 ## 2026-09-28 · 明文与落盘的敏感面（P2，已接受的代价）
 

@@ -112,10 +112,11 @@ sudo -S -p '' --user root -- sh -c '<原命令，含 cd 前缀>'
 | `elevate_password` | **留空即复用登录口令**（`password`）。sudo 校验的本来就是登录用户自己的口令，所以 Ubuntu 这类机器通常什么都不用填 |
 | `elevate_user` | 提权目标，默认 `root` |
 
-两条配套行为：
+三条配套行为：
 
 - **提权命令一律查 killlist**，无视主机是否在 `guarded_hosts` 里。命中照样可以 `force=true` 越过，审计记 `rule:"forced"` + `elevated:true`。
 - `cd` 的探活也跟着走提权 —— `cd /root` 用主账号验会假失败（实测 `exit_code: 1`，`权限不够`），验不过就不该把 cwd 记进去。
+- `auth`（登录认证方式）与 `elevate_password_from`（提权口令来源）是**两个独立字段**：主机改成仅密钥登录后 `auth` 变 `"key"`，而 `elevate_password_from` 仍可以是 `"password"` —— 口令只喂给 `sudo -S` 的 channel stdin，与怎么登录无关（100 实测：key 登录下提权照常 `ran_as: root`）。
 
 口令错时不会挂死：喂完口令服务端立即 `shutdown_write()`，sudo 重试读到 EOF 就放弃。实测错口令 **2.5s** 返回 `exit_code: 1` + `sudo: Authentication failed`；不关 stdin 时它会阻塞到 idle 超时（实测 21s 才带着假的 `timed_out:"idle"` 回来）。
 
@@ -143,7 +144,7 @@ sudo -S -p '' --user root -- sh -c '<原命令，含 cd 前缀>'
 
 ## 工具
 
-- `list_hosts()` —— 主机、`pin_source`、是否查清单、限额。不含密码。
+- `list_hosts(brief?)` —— 主机、`pin_source`、是否查清单、限额。`brief=true` 只回短字段（不带每台的 limits 与全量 killlist），省上下文。不含密码。
 - `exec(host, command, cwd?, idle_timeout?, max_duration?, force?, elevate?, detach?)` —— 离散命令。`cwd` 由服务端按主机记忆：单发一条 `cd <目录>`（或光一个 `cd` 回 home）验活成功后写入，后续命令自动从该目录开始；`cd X && cmd` 复合形态只影响本条。被拦下时不建立连接。`elevate=true` 以 root 跑这一条（凭据里得先给这台开 `elevate`）。`detach=true` 丢后台跑并立刻返回 `job_id`（见「后台任务」一节）。
 - `pin_hostkey(host, trust?)` —— 探测主机指纹；`trust=true` 才写 `hostkeys.json`。
 - `put_file(host, local, remote, overwrite?, force?, elevate?, restart?, mode?)` —— 本机 → 远端，分片续传 + md5。
@@ -262,6 +263,7 @@ SFTP 以登录用户身份写 `/root`、`/etc` 实测都是 `Permission denied`�
 - `job_kill` 先对进程组 SIGTERM，5 秒不退再 SIGKILL，另有子进程树兜底（setsid 不可用的主机）；杀前同样过 `job_is_ours`。
 - `job_status` 给 `offset` 就只回新增部分（返回 `offset_next` 供下次接着取），不给就回最后 `max_bytes` 字节。输出只在远端 `out` 文件，不占本机 `output/` 配额。
 - 保留 7 天（按结束标记的 mtime 判，job-start 时顺手清）+ 并发上限 8，都可改 `policy.json` 的 `defaults.job_retention_days` / `job_max_concurrent`；超限时 `exec(detach=true)` 返回 `too_many_jobs`。
+- 失联任务（机器重启、进程被 `kill -9` 后不留下退出标记）不会卡住池子：`job_list` 里显示为 `lost`，`job_kill` 对它补写 `killed` 标记完成**回收**（返回 `reaped: true`）——不再占并发名额，7 天后随其它结束任务一起被清。
 - 审计：起/杀各记一条（`job_started` / `job_killed`，带 job_id）；`job_status` / `job_list` 是纯读，不审计。
 - **v1 明确排除**：elevate 的 detach（口令注入与 setsid 的组合没验过，会返回 `elevate_detach_unsupported`）；`out` 合并 stdout/stderr 不分离。
 - 脚本一律 POSIX sh、不含顶层 `exit`、不用 heredoc —— 为将来可能的 shell/交互通道留的（片段会被粘进活 shell，`exit` 会直接杀掉会话）。
@@ -279,10 +281,18 @@ SFTP 以登录用户身份写 `/root`、`/etc` 实测都是 `Permission denied`�
 ## 超时
 
 - `idle_timeout_s`（默认 30）：**无新输出**才触发。下载有进度条会不断重置，不会被误杀。
-- `max_duration_s`（默认 300）：缺省值。**调用方传的 `max_duration` 不再被夹制**，传多大用多大 —— 长构建（`cmake`、`pip install torch`）靠这个跑完，M2 的 `detach` 因此不再紧迫。
+- `max_duration_s`（默认 300）：缺省值。**调用方传的 `max_duration` 不再被夹制**，传多大用多大。注意它管不了单次调用的客户端硬上限（约 60 秒，见「后台任务」）——长构建（`cmake`、`pip install torch`）要等完得走 `exec(detach=true)`。
 - 两种超时各归各的：`wait=min(idle,剩余时长)`，谁定的这一轮就报谁，所以传 `max_duration=1` 会得到 `timed_out: "duration"` 而不是 `idle`（真机实测修过一次误报）。
 - 超时只关 channel 不关连接，后续命令照常。
 - 超时被打断时，**已经收到的输出仍在 `output/` 里**，可以 `read_output` 捞回来看跑到哪一步了。
+
+## 判活（探进程 / 看文件出没）
+
+没有"等进程结束 / 等文件出现"的工具，这类等待要自己写**秒级**短查询（单次调用远小于 60 秒）。规矩别用错——下面两条都是实测踩出来的假阴性：
+
+- **跨用户判活必须带 `elevate=true`**：`kill -0 <root 的 pid>` 用普通账号跑返回 EPERM，rc 与"进程不存在"同为 1，看起来像已经退出（实测据此误判过一次 apt 还在跑）。
+- **`pgrep` 别用 `-f` 匹配长模式**：模式串就写在承载它的那条 `bash -c` 命令行里，永远命中自己（实测轮询循环永不退出）。用 `pgrep -x <comm>`（comm 截 15 字符）按进程名取 PID，并把"取 PID"和"kill"分成两条调用——`pkill -f` 加同一行里的裸词 grep 会把自己杀掉，症状是 `exit_code:-1`、零输出。
+- **长任务优先 `exec(detach=true)` + `job_status` 轮询**：判活在服务端做（任务状态机 running/exited/killed/lost），不用手写轮询。
 
 ## CLI（人在终端敲）
 
@@ -298,7 +308,7 @@ uv run --quiet ssh_mcp.py list      # 主机、guard 是否生效、pin 来源�
 1. **服务端不再做任何权限判断**（除受保护主机的 killlist，而 force=true 一步就过）。同一台机器上「读一眼」和「`rm -rf`」的代价完全相同，唯一的地板是远端账号权限。`66` 原先靠 `rw_allowed: false` 被锁成只读，现在没有那层了 —— 它靠 `guarded_hosts` 点名换来的是「挡手滑」，不是「挡越权」。
 2. `hostkeys.json` 与凭据同属当前用户，Agent 用文件工具理论上能直接改它。`pin_hostkey` 的两步（探测 → `trust=true`）靠的是**约定和向用户回报**，不是强制。要硬边界就得把这个文件放到另一个 Windows 用户下，或全部改用非 root 账号。
 3. 静态分析有地板，见上面「设计上不再防的形态」。包装器与解释器的反绕过机制是主动删掉的，不是漏了。
-4. 引号内的 `>` `<` 已通过掩码排除；但 `grep a>b`（未加引号）里的 `>` 仍会被当成重定向目标去看一眼 —— 只有撞上那张敏感文件名单才拦，日常不会误杀。
+4. 引号内的 `>` `<` 已通过掩码排除；`grep a>b`（未加引号）里的 `>` 仍会被当成**写**重定向看一眼 —— 只有撞上那张敏感文件名单才拦，日常不会误杀。`<` / `<<` / `<<<` 不算写（读重定向与 heredoc 不落文件，2026-10-14 起不收进写目标——此前 `wc -l < 密钥文件` 这类只读会被误拦）。
 5. 密码解密后常驻服务进程内存。长期方案是全量转私钥认证。
 6. `username == "root"` 这一条判定分支没有真机证据：唯一配置的 root 主机 `admin`（pve2）在凭据文件里没条目，而真机测试只允许在 100 上跑。**「命中 → 拒且不建连 → force 送到远端 → 审计记 forced」整条链路已在 100 上用 `guarded_hosts` 点名真机验过**（`userdel` 不存在用户返回 exit 6，证明确实执行了），root 分支与非 root 点名分支在代码里是同一个 `G.applies` 谓词，只差那半行。要补的是 `admin` 的凭据，不是代码。
 7. 原先被错杀的只读用法现在都能跑了：裸 `mount`（只是打印挂载表）、`fdisk -l`、`docker system prune -af`、`kubectl delete`、`crontab -r`、`history -c`、`sudo`。

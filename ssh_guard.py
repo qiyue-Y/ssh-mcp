@@ -19,6 +19,9 @@ from dataclasses import dataclass, field
 OPERATOR_TOKENS = frozenset({";", "&&", "||", "|", "&"})
 SEP_CHARS = ";|&"
 REDIRECT_TOKENS = frozenset({">", ">>", "<", "<<<", "1>", "2>", "&>", "&>>", "<>", ">|"})
+# 读/非文件重定向：`<` 只读，`<<`/`<<<` 是 heredoc / here-string 的分隔词，都不写文件。
+# 收进「写目标」会把只读探查看成写 —— 2026-10-14 实测 `wc -l < 密钥文件` 被 deny:写入敏感文件 拦下。
+READ_REDIRECTS = frozenset({"<", "<<", "<<<"})
 # `2>&1` 只复制描述符，不落文件，不该当成写
 FD_DUP = re.compile(r"^\d*<&\d+$|^\d*>&\d*$")
 REDIRECT_SPLIT = re.compile(r"^(\d*)(>>|<<|<>|>\||>|<)(.*)$")
@@ -173,7 +176,7 @@ def split_segments(tokens: list[str]) -> list[list[str]]:
 
 
 def redirect_targets(tokens: list[str]) -> list[str]:
-    """抽出重定向目标；`1>/tmp/a`、`>>x` 这类连写形式也要认。"""
+    """抽出**写**重定向目标；`1>/tmp/a`、`>>x` 这类连写形式也要认，`<`/`<<`/`<<<` 不算写。"""
     targets: list[str] = []
     idx = 0
     while idx < len(tokens):
@@ -181,13 +184,13 @@ def redirect_targets(tokens: list[str]) -> list[str]:
         if FD_DUP.match(tok):
             idx += 1
             continue
-        if tok in REDIRECT_TOKENS:
+        if tok in REDIRECT_TOKENS and tok not in READ_REDIRECTS:
             if idx + 1 < len(tokens):
                 targets.append(tokens[idx + 1])
             idx += 2
             continue
         m = REDIRECT_SPLIT.match(tok)
-        if m and m.group(3):
+        if m and m.group(3) and m.group(2) not in READ_REDIRECTS:
             targets.append(m.group(3))
         idx += 1
     return targets
