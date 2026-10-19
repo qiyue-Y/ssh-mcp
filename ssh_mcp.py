@@ -24,7 +24,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextvars
+import functools
 import hashlib
+import inspect
 import json
 import os
 import shlex
@@ -34,6 +37,7 @@ import stat
 import sys
 import threading
 import time
+import traceback
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -93,7 +97,8 @@ INLINE_OUT = (4096, 4096)
 INLINE_ERR = (1024, 2048)
 OUTPUT_KEEP_RUNS = int(os.environ.get("SSHMCP_OUTPUT_KEEP_RUNS", "200"))
 OUTPUT_KEEP_BYTES = int(os.environ.get("SSHMCP_OUTPUT_KEEP_BYTES", str(500 * 1024 * 1024)))
-OUTPUT_KEEP_DAYS = int(os.environ.get("SSHMCP_OUTPUT_KEEP_DAYS", "7"))
+OUTPUT_KEEP_DAYS = int(os.environ.get("SSHMCP_OUTPUT_KEEP_DAYS", "14"))
+AUDIT_KEEP_DAYS = int(os.environ.get("SSHMCP_AUDIT_KEEP_DAYS", "14"))
 
 
 def log(msg: str) -> None:
@@ -235,30 +240,262 @@ def effective_pin(alias: str, cred: HostCred | None) -> tuple[str, str]:
 # --------------------------------------------------------------------------------------
 
 
+_CALL_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar("ssh_mcp_call_id", default=None)
+_CALL_TOOL: contextvars.ContextVar[str | None] = contextvars.ContextVar("ssh_mcp_call_tool", default=None)
+_AUDIT_LOCK = threading.Lock()
+_OUTPUT_HOSTS: dict[str, str] = {}
+_OUTPUT_HOSTS_LOCK = threading.Lock()
+_OUTPUT_HOSTS_MAX = 4096
+
+
 def audit(record: dict) -> None:
+    call_id = _CALL_ID.get()
+    if call_id:
+        record.setdefault("call_id", call_id)
+    tool = _CALL_TOOL.get()
+    if tool:
+        record.setdefault("tool", tool)
     record.setdefault("ts", iso(now_utc()))
-    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with AUDIT_PATH.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    with _AUDIT_LOCK:
+        AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            _rotate_audit()
+            _prune_audit()
+        except OSError as exc:  # 轮转失败不该挡执行：继续写当前文件
+            log(f"审计轮转失败（继续写当前文件）：{exc}")
+        with AUDIT_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+
+
+def _audit_files() -> list[Path]:
+    """当前文件 + 轮转出去的 ssh-mcp.YYYYMMDD[-n].jsonl，按 mtime 从旧到新。"""
+    if not AUDIT_PATH.parent.is_dir():
+        return []
+    stem, suffix = AUDIT_PATH.stem, AUDIT_PATH.suffix
+    rotated: list[Path] = []
+    for path in AUDIT_PATH.parent.glob(f"{stem}.*{suffix}"):
+        if not path.is_file():
+            continue
+        middle = path.name[len(stem) + 1 : len(path.name) - len(suffix)]
+        head = middle.split("-")[0]
+        if len(head) == 8 and head.isdigit():
+            rotated.append(path)
+    files = rotated + ([AUDIT_PATH] if AUDIT_PATH.is_file() else [])
+
+    def mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    return sorted(files, key=lambda p: (mtime(p), p.name))
+
+
+def _rotate_audit() -> None:
+    """写新一天的第一条记录前，把旧文件按最后写入日期改名归档。"""
+    try:
+        mtime = AUDIT_PATH.stat().st_mtime
+    except FileNotFoundError:
+        return
+    day = datetime.fromtimestamp(mtime, timezone.utc).date()
+    if day >= now_utc().date():
+        return
+    dest = AUDIT_PATH.with_name(f"{AUDIT_PATH.stem}.{day:%Y%m%d}{AUDIT_PATH.suffix}")
+    n = 1
+    while dest.exists():
+        dest = AUDIT_PATH.with_name(f"{AUDIT_PATH.stem}.{day:%Y%m%d}-{n}{AUDIT_PATH.suffix}")
+        n += 1
+    AUDIT_PATH.rename(dest)
+
+
+def _prune_audit() -> None:
+    cutoff = time.time() - AUDIT_KEEP_DAYS * 86400
+    for path in _audit_files():
+        if path == AUDIT_PATH:
+            continue
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def audit_tail(alias: str | None, limit: int) -> list[dict]:
-    try:
-        lines = AUDIT_PATH.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return []
     out: list[dict] = []
-    for line in reversed(lines):
+    for path in reversed(_audit_files()):  # 新文件在前
         try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
             continue
-        if alias and rec.get("host") != alias:
-            continue
-        out.append(rec)
-        if len(out) >= limit:
-            break
+        for line in reversed(lines):
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if alias and rec.get("host") != alias:
+                continue
+            out.append(rec)
+            if len(out) >= limit:
+                return out
     return out
+
+
+def _remember_output_host(output_id: str | None, host: str | None) -> None:
+    """记 output_id 属于哪台主机，供 read_output 的审计补 host。"""
+    if not output_id or not host:
+        return
+    with _OUTPUT_HOSTS_LOCK:
+        _OUTPUT_HOSTS.pop(output_id, None)
+        _OUTPUT_HOSTS[output_id] = host
+        while len(_OUTPUT_HOSTS) > _OUTPUT_HOSTS_MAX:
+            _OUTPUT_HOSTS.pop(next(iter(_OUTPUT_HOSTS)))
+
+
+def _host_of_output(output_id: str | None) -> str | None:
+    """先查内存表；服务重启后表为空，就回扫审计里的同 output_id 记录。"""
+    if not output_id:
+        return None
+    with _OUTPUT_HOSTS_LOCK:
+        host = _OUTPUT_HOSTS.get(output_id)
+    if host:
+        return host
+    for path in reversed(_audit_files()):
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            continue
+        for line in reversed(lines):
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("output_id") == output_id and rec.get("host"):
+                _remember_output_host(output_id, rec["host"])
+                return rec["host"]
+    return None
+
+
+# 每次工具调用统一留痕：入口记 call，出口记 result/error，大内容只记引用不复制。
+_AUDIT_ARGS = {
+    "list_hosts": ("brief",),
+    "exec": ("host", "command", "cwd", "idle_timeout", "max_duration", "force", "elevate", "detach"),
+    "pin_hostkey": ("host", "trust"),
+    "put_file": ("host", "local", "remote", "overwrite", "force", "elevate", "restart", "mode"),
+    "get_file": ("host", "remote", "local", "overwrite", "elevate", "restart"),
+    "xfer_stat": ("host", "remote"),
+    "session_reset": ("host",),
+    "audit_tail": ("host", "limit"),
+    "read_output": ("output_id", "stream", "mode", "start", "end", "pattern", "limit"),
+    "job_status": ("host", "job_id", "offset", "max_bytes"),
+    "job_kill": ("host", "job_id"),
+    "job_list": ("host", "limit"),
+}
+
+_RESULT_FIELDS = (
+    "host", "blocked", "reason", "hint", "error", "aborted", "exit_code", "timed_out",
+    "truncated", "output_id", "bytes", "verified", "md5", "md5_local", "md5_remote", "md5_match",
+    "state", "job_id", "pid", "result", "probed", "match", "pinned", "fingerprint", "key_type",
+    "address", "writable", "exists", "size", "mode", "found", "reset", "final", "part",
+    "bytes_total", "lines_total", "matched", "count", "out_bytes", "offset_next", "elapsed_s",
+    "rate_mb_s", "resumed_from",
+)
+
+
+def _clip(value, limit: int = 300):
+    if isinstance(value, str) and len(value) > limit:
+        return value[:limit] + f"…[{len(value)} chars]"
+    return value
+
+
+def _audit_args(tool: str, bound: inspect.BoundArguments) -> dict:
+    return {name: bound.arguments[name] for name in _AUDIT_ARGS.get(tool, ()) if name in bound.arguments}
+
+
+def _result_ok(tool: str, result) -> bool:
+    if not isinstance(result, dict):
+        return True
+    if result.get("blocked") or result.get("error") or result.get("aborted"):
+        return False
+    if result.get("timed_out") or result.get("verified") is False or result.get("probed") is False:
+        return False
+    if tool == "exec" and result.get("exit_code") == -1:
+        return False
+    return True
+
+
+def _summarize_result(tool: str, result) -> dict:
+    """返回值的摘要：只留诊断字段和引用，正文不复制；失败时最多留 stderr 前 300 字符。"""
+    if not isinstance(result, dict):
+        return {"type": type(result).__name__}
+    out = {k: _clip(result[k]) for k in _RESULT_FIELDS if k in result and result[k] is not None}
+    if tool == "list_hosts":
+        out["host_count"] = len(result.get("hosts") or [])
+    elif tool == "audit_tail":
+        out["record_count"] = len(result.get("records") or [])
+    elif tool == "read_output":
+        out["text_chars"] = len(result.get("text") or "")
+    elif tool == "job_status":
+        out["text_bytes"] = len((result.get("text") or "").encode("utf-8"))
+    elif tool == "job_list":
+        out["job_count"] = result.get("count", len(result.get("jobs") or []))
+    if result.get("stderr") and (not _result_ok(tool, result) or result.get("exit_code") not in (None, 0)):
+        out["stderr_head"] = _clip(result["stderr"])
+    if "exit_code" in out:
+        out["command_ok"] = out["exit_code"] in (0, None)
+    return out
+
+
+def _audit_safe(record: dict) -> None:
+    try:
+        audit(record)
+    except Exception as exc:  # 审计只是留痕，不能反过来把工具弄挂；exec 自己那条仍是 fail closed
+        log(f"审计写入失败：{exc}")
+
+
+def _audited(tool: str):
+    def deco(fn):
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            call_id = uuid.uuid4().hex[:16]
+            id_token = _CALL_ID.set(call_id)
+            tool_token = _CALL_TOOL.set(tool)
+            started = time.monotonic()
+            try:
+                bound = sig.bind(*args, **kwargs)
+                bound.apply_defaults()
+                host = bound.arguments.get("host")
+                if host is None and tool == "read_output":
+                    host = _host_of_output(str(bound.arguments.get("output_id") or ""))
+                _audit_safe({"event": "call", "host": host, "args": _audit_args(tool, bound)})
+                try:
+                    result = await fn(*args, **kwargs)
+                except Exception as exc:
+                    _audit_safe({
+                        "event": "error",
+                        "host": host,
+                        "duration_ms": round((time.monotonic() - started) * 1000, 1),
+                        "error": f"{type(exc).__name__}: {_clip(str(exc))}",
+                        "traceback": _clip(traceback.format_exc(), 2000),
+                    })
+                    raise
+                _audit_safe({
+                    "event": "result",
+                    "host": host,
+                    "ok": _result_ok(tool, result),
+                    "duration_ms": round((time.monotonic() - started) * 1000, 1),
+                    "result": _summarize_result(tool, result),
+                })
+                return result
+            finally:
+                _CALL_TOOL.reset(tool_token)
+                _CALL_ID.reset(id_token)
+
+        return wrapper
+
+    return deco
 
 
 # --------------------------------------------------------------------------------------
@@ -602,11 +839,12 @@ def run_command(cred: HostCred, pin: str, command: str, cwd: str, idle_s: float,
                 continue
             break
     assert last_exc is not None
+    spill.write("err", f"{type(last_exc).__name__}: {last_exc}".encode("utf-8", "replace"))
     spill.close()
     return RunResult(
         exit_code=-1,
         stdout="",
-        stderr=f"{type(last_exc).__name__}: {last_exc}",
+        stderr=spill.inline("err"),
         truncated=False,
         timed_out="connect_failed",
         output_id=spill.run_id,
@@ -719,6 +957,7 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
         res = run_command(cred, pin, command, start_cwd, idle_s, max_s, spill, elevate)
         end_cwd = start_cwd
 
+    _remember_output_host(res.output_id, alias)
     audit(
         {
             "host": alias,
@@ -731,6 +970,7 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
             "exit_code": res.exit_code,
             "output_id": res.output_id,
             "output": res.stats,
+            **({"stderr_head": res.stderr[:300]} if res.stderr and (res.timed_out or res.exit_code != 0) else {}),
         }
     )
     return _ok(alias, command, res, start_cwd, end_cwd, hit.rule if hit else None, elevate, cred.elevate_user or "root")
@@ -819,6 +1059,7 @@ def _tool_list_hosts(brief: bool = False) -> dict:
                     "max_output_file_bytes": guard.max_output_bytes,
                     "inline_output": f"stdout 头 {INLINE_OUT[0]}B + 尾 {INLINE_OUT[1]}B（stderr {INLINE_ERR[0]}/{INLINE_ERR[1]}），全文用 read_output(output_id) 回捞",
                     "output_retention": f"{OUTPUT_KEEP_DAYS} 天 / ≤{OUTPUT_KEEP_RUNS} run / ≤{OUTPUT_KEEP_BYTES // 1048576}MB",
+                    "audit_retention": f"{AUDIT_KEEP_DAYS} 天（按天轮转，SSHMCP_AUDIT_KEEP_DAYS）",
                     "xfer_dir": str(xfer_dir(guard)),
                     "max_transfer_bytes": guard.max_transfer_bytes,
                     "xfer_chunk_bytes": guard.xfer_chunk_bytes,
@@ -1362,6 +1603,7 @@ def build_server():
     server = server_class("ssh-mcp")
 
     @server.tool(name="list_hosts", description="列出凭据文件里的主机、指纹固定状态、是否受 killlist 保护及其原因。brief=true 只回短字段（不带每台的 limits 与全量 killlist），省上下文。不含任何密码。")
+    @_audited("list_hosts")
     async def _list_hosts(brief: bool = False) -> dict:
         return _tool_list_hosts(brief)
 
@@ -1378,6 +1620,7 @@ def build_server():
             "——状态存在远端 ~/.sshmcp-jobs/，服务重启/断连/换会话都不丢；v1 与 elevate 互斥。"
         ),
     )
+    @_audited("exec")
     async def _exec(
         host: str,
         command: str,
@@ -1403,6 +1646,7 @@ def build_server():
             "探测只做到密钥交换，不发送用户名与密码。凭据文件里已钉的 hostKey 由人自己改，这里覆盖不了。"
         ),
     )
+    @_audited("pin_hostkey")
     async def _pin_hostkey(host: str, trust: bool = False) -> dict:
         import anyio
 
@@ -1418,6 +1662,7 @@ def build_server():
             "上限取 policy.json 的 defaults.max_transfer_bytes（现 4GB）。"
         ),
     )
+    @_audited("put_file")
     async def _put_file(
         host: str,
         local: str,
@@ -1442,6 +1687,7 @@ def build_server():
             "读 root 才可见的文件用 elevate=true（服务端先 sudo cat 到暂存再取回）。"
         ),
     )
+    @_audited("get_file")
     async def _get_file(
         host: str,
         remote: str,
@@ -1460,18 +1706,21 @@ def build_server():
         name="xfer_stat",
         description="取远端文件的 size/mode/uid/mtime，用于传前判断该不该传（比 exec ls -l 少一次文本解析）。不建立传输。",
     )
+    @_audited("xfer_stat")
     async def _xfer_stat(host: str, remote: str) -> dict:
         import anyio
 
         return await anyio.to_thread.run_sync(lambda: _tool_xfer_stat(host, remote))
 
     @server.tool(name="session_reset", description="丢弃某主机的 SSH 连接与 cwd 状态并重新握手。")
+    @_audited("session_reset")
     async def _session_reset(host: str) -> dict:
         import anyio
 
         return await anyio.to_thread.run_sync(lambda: _tool_session_reset(host))
 
     @server.tool(name="audit_tail", description="读回最近的审计记录（含被拒命令），用于自查拒绝原因。")
+    @_audited("audit_tail")
     async def _audit_tail(host: str | None = None, limit: int = 50) -> dict:
         return _tool_audit_tail(host, limit)
 
@@ -1483,6 +1732,7 @@ def build_server():
             "典型用法：grep 'error' 拿到行号，再用 lines(start=行号-20, end=行号+40) 看上下文。"
         ),
     )
+    @_audited("read_output")
     async def _read_output(
         output_id: str,
         stream: str = "out",
@@ -1502,6 +1752,7 @@ def build_server():
             "state：running/exited/killed/lost/missing。输出在远端 out 文件里，不占本机 output/ 配额。"
         ),
     )
+    @_audited("job_status")
     async def _job_status(host: str, job_id: str, offset: int | None = None, max_bytes: int = 65536) -> dict:
         import anyio
 
@@ -1514,6 +1765,7 @@ def build_server():
             "杀前核对进程命令行里确实是这个 job id（防 PID 复用误杀）；已结束的任务只会返回 not_running。"
         ),
     )
+    @_audited("job_kill")
     async def _job_kill(host: str, job_id: str) -> dict:
         import anyio
 
@@ -1526,6 +1778,7 @@ def build_server():
             "保留期与并发上限取 policy.json 的 defaults.job_retention_days / job_max_concurrent。"
         ),
     )
+    @_audited("job_list")
     async def _job_list(host: str, limit: int = 20) -> dict:
         import anyio
 
@@ -1543,7 +1796,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     print(f"limits : {POLICY_PATH}")
     print(f"凭据   : {HOSTS_PATH}{'（不存在）' if not HOSTS_PATH.exists() else ''}")
     print(f"指纹   : {HOSTKEYS_PATH}{'（不存在）' if not HOSTKEYS_PATH.exists() else ''}")
-    print(f"audit  : {AUDIT_PATH}")
+    print(f"audit  : {AUDIT_PATH}（保留 {AUDIT_KEEP_DAYS} 天，按天轮转）")
     try:
         guard = GUARD.get()
     except Exception as exc:  # noqa: BLE001

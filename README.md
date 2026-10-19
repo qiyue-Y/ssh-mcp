@@ -45,6 +45,12 @@ python test_ssh_guard.py
 python test_output_store.py
 ```
 
+审计留痕的离线用例（call/result/error、轮转、14 天保留、output_id→host；11 例）：
+
+```powershell
+python test_audit.py
+```
+
 前置检查、指纹固定与执行接线的用例要真导入 paramiko，必须用 `uv run`，且**不能写成 `uv run python xxx.py`** —— 那种写法不读文件头的 PEP 723 deps，会拿到本机 site-packages 里缺 `cryptography` 的 paramiko 而报 ModuleNotFoundError：
 
 ```powershell
@@ -154,7 +160,7 @@ sudo -S -p '' --user root -- sh -c '<原命令，含 cd 前缀>'
 - `job_kill(host, job_id)` —— 停后台任务：进程组 SIGTERM→5 秒后 SIGKILL，带队里子进程树，杀前核对 `job_is_ours`。
 - `job_list(host, limit?)` —— 列最近的后台任务（running/exited/killed/lost），找孤儿用。
 - `session_reset(host)` —— 丢连接与 cwd 重来。
-- `audit_tail(host?, limit?)` —— 回看最近审计（含被拦的）。
+- `audit_tail(host?, limit?)` —— 回看最近审计（含被拦的）。所有工具调用都留 `call`/`result` 记录，可用 `call_id` 串联。
 - `read_output(output_id, stream?, mode?, start?, end?, pattern?, limit?)` —— 按 `exec` 返回的 `output_id` 回捞全文。`mode`：`head`/`tail` 按行边界取，`grep` 返回**带行号**的命中（`pattern` 是**子串**匹配，不是正则），`lines` 取 `[start,end]` 行；单次上限 16KB。
 
 **没有** 交互 shell / PTY / 按键透传，这是故意的：netcatty 那套长会话死在 `terminal_execute` 全部挂起上。
@@ -264,16 +270,26 @@ SFTP 以登录用户身份写 `/root`、`/etc` 实测都是 `Permission denied`�
 - `job_status` 给 `offset` 就只回新增部分（返回 `offset_next` 供下次接着取），不给就回最后 `max_bytes` 字节。输出只在远端 `out` 文件，不占本机 `output/` 配额。
 - 保留 7 天（按结束标记的 mtime 判，job-start 时顺手清）+ 并发上限 8，都可改 `policy.json` 的 `defaults.job_retention_days` / `job_max_concurrent`；超限时 `exec(detach=true)` 返回 `too_many_jobs`。
 - 失联任务（机器重启、进程被 `kill -9` 后不留下退出标记）不会卡住池子：`job_list` 里显示为 `lost`，`job_kill` 对它补写 `killed` 标记完成**回收**（返回 `reaped: true`）——不再占并发名额，7 天后随其它结束任务一起被清。
-- 审计：起/杀各记一条（`job_started` / `job_killed`，带 job_id）；`job_status` / `job_list` 是纯读，不审计。
+- 审计：起/杀各记一条（`job_started` / `job_killed`，带 job_id）；`job_status` / `job_list` 也记 `call`/`result` 元数据（任务列表与输出正文不复制进审计）。
 - **v1 明确排除**：elevate 的 detach（口令注入与 setsid 的组合没验过，会返回 `elevate_detach_unsupported`）；`out` 合并 stdout/stderr 不分离。
 - 脚本一律 POSIX sh、不含顶层 `exit`、不用 heredoc —— 为将来可能的 shell/交互通道留的（片段会被粘进活 shell，`exit` 会直接杀掉会话）。
+
+## 审计与追溯
+
+每个 MCP 工具调用写两条元数据：入口 `call`（工具名、参数、host、`call_id`），出口 `result` 或 `error`（ok、`duration_ms`、结果摘要；异常带类型、消息与调用栈）。工具内部原有的 `intent` / `executed` / `blocked` / `transferred` / `job_started` 等记录会自动带上同一个 `call_id`，一次调用前后的线索可以直接串起来。
+
+- **审计只放元数据和引用**：命令原文、退出码、`output_id`、传输字节数与 md5 进审计；stdout/stderr/文件内容不复制进审计，它们留在 `output/` 与传输目标里，按引用回查。
+- 审计文件按天轮转：`audit/ssh-mcp.jsonl` → `audit/ssh-mcp.YYYYMMDD.jsonl`，保留 **14 天**（`SSHMCP_AUDIT_KEEP_DAYS`），路径可用 `SSHMCP_AUDIT` 覆盖。
+- `audit_tail(host?, limit?)` 会按时间倒序读当前文件与轮转文件；排障时先按 host/时间找到 `call_id`，再看这次调用的 `call`、工具内部记录与最终 `result`/`error`。
+- `read_output` 本身没有 host 参数：服务端用内存里的 `output_id → host` 表补 host；服务重启后表为空时会回扫审计文件里同 `output_id` 的 `executed` 记录，所以按主机过滤也能看到回捞动作。
+- 审计写入失败时：`exec` 的 `intent` 仍是 fail closed（写不进就不执行）；包装层的 `call`/`result` 是尽力而为，只往 stderr 报错，不影响只读工具。
 
 ## 全文日志与轮转
 
 落**本机**不落远端：rw 主机也没必要在人家盘上堆调试垃圾，写远端文件本身还可能踩到只读挂载。
 
 - 单文件上限取 `policy.defaults.max_output_bytes`（现 8MB），超出即停止写入并在 `output.<stream>.overflow` 里标记
-- 轮转预算：`7 天` 且 `≤200 个 run` 且 `≤500MB`，任一命中就删整组；每次 `exec` 前顺手清一次（无定时器、无后台线程）
+- 轮转预算：`14 天` 且 `≤200 个 run` 且 `≤500MB`，任一命中就删整组；每次 `exec` 前顺手清一次（无定时器、无后台线程）
 - 以上预算可用环境变量覆盖：`SSHMCP_OUTPUT`（目录）、`SSHMCP_OUTPUT_KEEP_RUNS`、`SSHMCP_OUTPUT_KEEP_BYTES`、`SSHMCP_OUTPUT_KEEP_DAYS`
 - **全文是原文落盘，不做脱敏。** 构建日志里可能出现 `--password=`、`Authorization:`、带 token 的镜像源 URL。`output/` 已进 `.gitignore`，但如果你在本机跑了文件同步/分享工具，别让它覆盖这个目录 —— 这是这套设计换来的代价，换掉的收益是「Agent 能拿到结论而不用吞 80KB 日志」。
 - 日志目录与审计目录写不了就**拒绝执行**（fail closed），不会静默降级成「只有内存里那份」。
