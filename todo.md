@@ -196,17 +196,48 @@
 
 ## P2-1 主机能力字段 `critical` / `disabled` / `xfer`
 
-**状态：待办**
+**状态：已完成（2026-11-09）**
+
+**实测证据**
+- `disabled: true`：`exec` 在 `_preflight` 就返回 `{blocked, reason:"host_disabled"}`，不建连（用例断言 `POOL.connected` 为假）。
+- `critical: true`：非 root 主机也查 killlist；`list_hosts` 的 `guard_reason` 显示「critical 标记」，`force=true` 仍可越过。
+- `xfer: false`：`put_file`/`get_file` 返回 `xfer_disabled`；`xfer_stat` 只读元数据仍可用（未拦）。
+- 三个字段不填时行为与旧版完全一致（用例钉住默认值）。
+- 离线：`test_ssh_guard.py` 36 例、`test_connect_refusals.py` 95 例全绿。
 
 **目标**
 - 凭据文件增加 `critical: true`（永远查清单）、`disabled: true`（临时停用）、可选 `xfer: false`（禁传文件）。
 - `critical` 与 `policy.json` 的 `guarded_hosts` 合并，减少双文件维护。
 
-**范围**：`ssh_mcp.py` 的凭据模型、`list_hosts` 输出、README、用例。
+**范围**：`ssh_mcp.py` 的凭据模型、`list_hosts` 输出、`ssh_guard.applies` 的可选 critical 参数、README、用例。
 
 **验收**：`disabled` 主机的 `exec` 在建立连接前被拒；`critical` 主机即使非 root 也查清单；`xfer=false` 时 `put_file`/`get_file` 直接拒。
 
 **风险/回退**：字段都是可选的，不填即旧行为；`guarded_hosts` 保留兼容。
+
+---
+
+## P2-1b 主机清单可视化编辑（hosts_gui.py）
+
+**状态：已完成（2026-11-09）**
+
+**交付**
+- `hostreg.py`：凭据文件的唯一写入口——读取/校验/原子写/保存前备份（留最近 10 份）/保留 `_` 注释与未知字段/扫描 known_hosts 与 ssh config 出候选。
+- `ssh_probe.py`：指纹探测、私钥加载、一次性连测，从 `ssh_mcp.py` 抽出，GUI 不再反向依赖服务模块；探测仍只做密钥交换、不发凭据。
+- `hosts_gui.py`：tkinter 窗口——列表 + 表单、增改复制删、停用开关、探测指纹并确认、测试连接、从 known_hosts/ssh config 勾选导入；密码留空即不改、不回填明文。
+- `gen_hosts.py`：退成 `hostreg` 的薄壳 CLI（默认只列候选，`--merge` 才写）。
+- `ssh_mcp.py`：只读凭据不变；探测相关函数改为从 `ssh_probe` 引入，`test_connect_refusals` 的 mock 点仍有效。
+
+**验证**
+- `test_hostreg.py` 18 例全绿（原子写、备份轮转、坏 JSON 拒写、password 留空保留、未知字段保留、扫描与去重）。
+- 原有 95 + 36 例、冒烟测试全绿（抽取后无回归）。
+- `hosts_gui.py --selftest` 能构造窗口并自动关闭；用演示数据实际打开截图核对过布局（标记列、表单、状态栏无裁切）。
+- 真机未做写操作验证：GUI 保存路径由 `test_hostreg.py` 的临时文件用例覆盖，未对真实 `ssh_mcp_hosts.json` 做写测试。
+
+**边界**
+- GUI 不是 MCP 工具，AI 碰不到凭据文件；服务进程仍然只读。
+- 不做命令执行、日志、批量运维。
+- 「测试连接」只跑固定探针，不开放任意命令输入。
 
 ---
 

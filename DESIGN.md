@@ -25,6 +25,8 @@
 
 `elevate` 保持现状：按主机开总开关、按命令显式 `elevate=true`，审计能看到 `ran_as=root`。不做默认提权，否则审计里分不清哪些命令是 root 跑的。
 
+**2026-11-09 已实现**：`disabled` / `critical` / `xfer` 三个能力位已进凭据模型与 `list_hosts`；`hosts_gui.py` 提供可视化的勾选与维护入口（`hostreg.py` 负责原子写与备份），`gen_hosts.py` 退成其命令行薄壳。`guarded_hosts` 保留兼容，`critical` 是它的替代写法。
+
 不建议加：命令白名单、角色、审批、配额。MCP 形态下没人逐条看，判定只会拖慢；而且命令过滤挡不住蓄意绕行。有时候必须让 AI 拿到更高权限来维持效率，这是有意的取舍。
 
 ### 1.2 killlist 升级为「不可逆动作清单」

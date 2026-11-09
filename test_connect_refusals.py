@@ -1479,5 +1479,49 @@ class TreeTransfer(unittest.TestCase):
         self.assertEqual(r["reason"], "remote_not_dir")
 
 
+class HostCapabilities(unittest.TestCase):
+    """P2-1 的三个能力位：disabled 建连前拒、critical 恒查清单、xfer=false 禁传。"""
+
+    def test_disabled_host_is_refused_before_connecting(self):
+        write_hosts({"100": {**PINNED, "disabled": True}})
+        res = M.execute("100", "hostname")
+        self.assertTrue(res["blocked"])
+        self.assertEqual(res["reason"], "host_disabled")
+        self.assertFalse(M.POOL.connected("100"))
+
+    def test_critical_host_is_guarded_even_if_not_in_guarded_hosts(self):
+        """用例自己的 policy 只点了 guarded-user；100 靠 critical 字段也必须查。"""
+        write_hosts({"100": {**PINNED, "critical": True}})
+        res = M.execute("100", "mkfs.ext4 /dev/sda1")
+        self.assertTrue(res["blocked"])
+        self.assertEqual(res["reason"], "killlisted")
+        data = M._tool_list_hosts()
+        entry = next(h for h in data["hosts"] if h["alias"] == "100")
+        self.assertEqual((entry["guard"], entry["guard_reason"]), ("killlist", "critical 标记"))
+        self.assertTrue(entry["critical"])
+
+    def test_critical_host_can_be_forced(self):
+        write_hosts({"100": {**PINNED, "critical": True}})
+        with mock.patch.object(M, "run_command", fake_run(0)):
+            res = M.execute("100", "mkfs.ext4 /dev/sda1", force=True)
+        self.assertEqual(res["forced_rule"], "deny:mkfs*")
+
+    def test_xfer_false_blocks_both_directions(self):
+        write_hosts({"100": {**PINNED, "xfer": False}})
+        src = Path(tempfile.mkdtemp(prefix="cap-put-")) / "a.txt"
+        src.write_bytes(b"x")
+        put = M._tool_put_file("100", str(src), "/tmp/x")
+        self.assertEqual((put["blocked"], put["reason"]), (True, "xfer_disabled"))
+        get = M._tool_get_file("100", "/tmp/x", str(src) + ".out")
+        self.assertEqual((get["blocked"], get["reason"]), (True, "xfer_disabled"))
+
+    def test_flags_default_to_old_behavior(self):
+        write_hosts({"100": dict(PINNED)})
+        entry = M.HOSTS.get()["100"]
+        self.assertFalse(entry.disabled)
+        self.assertFalse(entry.critical)
+        self.assertTrue(entry.xfer)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

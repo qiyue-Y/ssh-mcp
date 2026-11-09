@@ -381,9 +381,9 @@ def sensitive_write_targets(command: str) -> list[str]:
 
 
 
-def applies(cred_privileged: bool, alias: str, config: GuardConfig) -> bool:
-    """root 账号恒查；非 root 只有在 guarded_hosts 里点名了才查。"""
-    return cred_privileged or alias in config.guarded_hosts
+def applies(cred_privileged: bool, alias: str, config: GuardConfig, critical: bool = False) -> bool:
+    """root 恒查；凭据里标了 critical 的恒查；其余非 root 看 guarded_hosts 点没点名。"""
+    return cred_privileged or critical or alias in config.guarded_hosts
 
 
 def check(command: str, config: GuardConfig) -> Hit | None:

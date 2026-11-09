@@ -23,11 +23,9 @@ exec(force=true) 直接放行。真正的边界是远端账号自己的权限。
 from __future__ import annotations
 
 import argparse
-import base64
 import contextlib
 import contextvars
 import functools
-import hashlib
 import inspect
 import json
 import os
@@ -53,6 +51,13 @@ import ssh_guard as G  # noqa: E402
 import ssh_jobs as J  # noqa: E402
 import ssh_xfer as X  # noqa: E402
 import output_store as OS  # noqa: E402
+from ssh_probe import (  # noqa: E402 - 探测/私钥逻辑与 GUI 共用，见 ssh_probe.py
+    HostKeyMismatch,
+    build_pinned_policy as _build_pinned_policy,
+    load_private_key as _load_private_key,
+    probe_hostkey,
+    sha256_fingerprint,
+)
 
 
 def _downloads_dir() -> Path:
@@ -168,6 +173,13 @@ class HostCred:
     # 每条命令前 source 的初始化片段（如 conda 激活）。空表示不 source；
     # 失败时命令不执行并返回 exit 97，不会和用户命令的退出码混在一起。
     shell_init: str = ""
+    # 能力位（用户维护，见 hosts_gui.py）：
+    #   disabled  临时停用这台，建连前就拒，不删凭据
+    #   critical  永远查 killlist，等价于把别名写进 policy.json 的 guarded_hosts
+    #   xfer      false 表示只执行、禁止传文件
+    disabled: bool = False
+    critical: bool = False
+    xfer: bool = True
 
     @property
     def privileged(self) -> bool:
@@ -524,99 +536,6 @@ def _audited(tool: str):
 # --------------------------------------------------------------------------------------
 # SSH 连接池
 # --------------------------------------------------------------------------------------
-
-
-def sha256_fingerprint(key) -> str:
-    blob = key.asbytes()
-    digest = base64.b64encode(hashlib.sha256(blob).digest()).decode("ascii")
-    return f"SHA256:{digest.rstrip('=')}"
-
-
-def probe_hostkey(address: str, port: int = 22, timeout: float = 10.0) -> tuple[str, str]:
-    """只走到密钥交换为止取对方主机密钥，一个凭据都不发。
-
-    这是 pin_hostkey 能安全交给 AI 的前提：探测阶段不提交用户名/密码，
-    所以即便对端是台冒充的机器，密码也不会漏出去。
-    """
-    import paramiko
-
-    sock = socket.create_connection((address, port), timeout=timeout)
-    transport = None
-    try:
-        transport = paramiko.Transport(sock)
-        transport.start_client(timeout=timeout)
-        key = transport.get_remote_server_key()
-        return sha256_fingerprint(key), key.get_name()
-    finally:
-        if transport is not None:
-            try:
-                transport.close()
-            except Exception:  # noqa: BLE001 - 探测收尾的断开失败不影响已取到的密钥
-                pass
-        sock.close()
-
-
-class HostKeyMismatch(Exception):
-    pass
-
-
-def _build_pinned_policy(expected: str):
-    import paramiko
-
-    class _Pinned(paramiko.MissingHostKeyPolicy):
-        def missing_host_key(self, client, hostname, key):  # noqa: ARG002
-            got = sha256_fingerprint(key)
-            if expected and got != expected:
-                raise HostKeyMismatch(f"{hostname} 指纹不匹配：期望 {expected}，实际 {got}")
-            if not expected:
-                raise HostKeyMismatch(f"{hostname} 未固定主机指纹，拒绝连接（先调 pin_hostkey）")
-
-    return _Pinned()
-
-
-def _from_ssh_agent():
-    """把私钥交给 ssh-agent 签名：带 passphrase 的私钥不必进服务进程内存。
-
-    只取 agent 里的第一把 key。逐把试认证会连着打远端的失败次数，
-    NO_RETRY 那条教训（认证类错误重试只会喂 fail2ban）说的就是这个。
-    """
-    try:
-        from paramiko.agent import Agent
-
-        keys = Agent().get_keys()
-    except Exception:  # noqa: BLE001 - agent 服务没起时 paramiko 直接抛，按"没有可用 key"处理
-        return None
-    return keys[0] if keys else None
-
-
-def _load_private_key(cred: HostCred):
-    import paramiko
-
-    candidates = [cred.key_path] if cred.key_path else []
-    if not candidates:
-        ssh_dir = Path.home() / ".ssh"
-        candidates = [ssh_dir / n for n in ("id_ed25519", "id_rsa", "id_ecdsa", "id_dsa")]
-    loaders = [
-        getattr(paramiko, name)
-        for name in ("Ed25519Key", "RSAKey", "ECDSAKey", "DSSKey")
-        if hasattr(paramiko, name)
-    ]  # paramiko 5.x 删了 DSSKey，写死列表会让整条 key 认证炸掉
-    for raw in candidates:
-        path = Path(str(raw)).expanduser()
-        if not path.is_file():
-            continue
-        for loader in loaders:
-            try:
-                return loader.from_private_key_file(str(path))
-            except Exception:  # noqa: BLE001 - 类型不匹配是正常尝试路径
-                continue
-    key = _from_ssh_agent()
-    if key is not None:
-        return key
-    raise RuntimeError(
-        "找不到可用私钥：候选文件都解不开（带 passphrase 的文件私钥不支持），ssh-agent 里也没有 key。"
-        "请让 key_path 指向无口令私钥，或把私钥 ssh-add 进 agent"
-    )
 
 
 class Pool:
@@ -999,6 +918,13 @@ def _preflight(alias: str, command: str) -> tuple[dict | None, HostCred | None, 
             None,
             "",
         )
+    if cred.disabled:
+        return (
+            _block(alias, command, "host_disabled", "disabled",
+                   f"{alias} 在凭据文件里标了 disabled:true；要恢复就在 hosts_gui.py 里取消停用"),
+            None,
+            "",
+        )
     pin, _ = effective_pin(alias, cred)
     if not pin:
         return (
@@ -1087,7 +1013,7 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
     # 清单查不查：root 账号恒查，非 root 看 guarded_hosts 点没点名，提权一律查 ——
     # 一旦以 root 落地，破坏面和 root 账号完全同级，不该因为登录账号是 qy 就免检
     # 单独的 cd 只改服务端记的 cwd，不触碰远端状态，也不必查
-    guarded = G.applies(cred.privileged, alias, guard) or elevate
+    guarded = G.applies(cred.privileged, alias, guard, cred.critical) or elevate
     hit = None if cd_target is not None or not guarded else G.check(command, guard)
     if hit is not None and not force:
         return _block(alias, command, "killlisted", hit.rule,
@@ -1232,7 +1158,7 @@ def _tool_list_hosts(brief: bool = False) -> dict:
     for alias in sorted(creds):
         cred = creds[alias]
         pin, source = effective_pin(alias, cred)
-        guarded = G.applies(cred.privileged, alias, guard)
+        guarded = G.applies(cred.privileged, alias, guard, cred.critical)
         hosts.append(
             {
                 "alias": alias,
@@ -1244,7 +1170,11 @@ def _tool_list_hosts(brief: bool = False) -> dict:
                 "host_key_pinned": bool(pin),
                 "pin_source": source or None,
                 "guard": "killlist" if guarded else "none",
-                "guard_reason": "root 账号" if cred.privileged else ("guarded_hosts 点名" if alias in guard.guarded_hosts else ""),
+                "guard_reason": "root 账号" if cred.privileged else (
+                    "critical 标记" if cred.critical else ("guarded_hosts 点名" if alias in guard.guarded_hosts else "")),
+                "disabled": cred.disabled,
+                "critical": cred.critical,
+                "xfer": cred.xfer,
                 "elevate_available": cred.elevate,
                 "elevate_as": cred.elevate_user or "root",
                 "elevate_password_from": "elevate_password" if cred.elevate_password else ("password" if cred.password else "未配置"),
@@ -1341,7 +1271,7 @@ def _remote_home(sftp) -> str:
 def _transfer_guard(cred: HostCred, alias: str, remote: str, elevate: bool, force: bool) -> dict | None:
     """传输落点必须和 exec 走同一张清单，否则 SFTP 就是清单的绕过口。"""
     guard = GUARD.get()
-    if not (G.applies(cred.privileged, alias, guard) or elevate):
+    if not (G.applies(cred.privileged, alias, guard, cred.critical) or elevate):
         return None
     hit = G.check_write_target(remote)
     if hit is None or force:
@@ -1359,6 +1289,9 @@ def _tool_put_file(host: str, local: str, remote: str, overwrite: bool = False, 
         return refusal
     if elevate and not cred.elevate:
         return _block(host, f"<put> {remote}", "elevate_not_configured", "no_elevate", f"凭据文件里为 {host} 打开 elevate")
+    if not cred.xfer:
+        return _block(host, f"<put> {remote}", "xfer_disabled", "xfer_disabled",
+                      f"{host} 在凭据文件里标了 xfer:false（只执行、不传文件）；要传就在 hosts_gui.py 里勾回")
     blocked = _transfer_guard(cred, host, remote, elevate, force)
     if blocked is not None:
         return blocked
@@ -1494,6 +1427,9 @@ def _tool_get_file(host: str, remote: str, local: str = "", overwrite: bool = Fa
         return refusal
     if elevate and not cred.elevate:
         return _block(host, f"<get> {remote}", "elevate_not_configured", "no_elevate", f"凭据文件里为 {host} 打开 elevate")
+    if not cred.xfer:
+        return _block(host, f"<get> {remote}", "xfer_disabled", "xfer_disabled",
+                      f"{host} 在凭据文件里标了 xfer:false（只执行、不传文件）；要传就在 hosts_gui.py 里勾回")
     if recursive and elevate:
         return _block(host, f"<get> {remote}", "elevate_recursive_unsupported", "no_elevate_recursive",
                       "目录传输 v1 不支持 elevate：先在远端 tar 打包再下单个文件")
@@ -1759,7 +1695,7 @@ def _put_tree(host: str, cred: HostCred, pin: str, sftp, src_root: Path, remote_
     out["bytes_total"] = total
 
     policy = GUARD.get()
-    guarded = G.applies(cred.privileged, host, policy)
+    guarded = G.applies(cred.privileged, host, policy, cred.critical)
 
     for rel_dir in dirs:
         target = remote_root if not rel_dir else f"{remote_root.rstrip('/')}/{rel_dir}"
@@ -2339,17 +2275,21 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     creds = HOSTS.get()
     print(
         f"\n主机 {len(creds)} 台，killlist {len(guard.kill_prefixes)} 条"
-        f"（root 账号恒查；非 root 只有 guarded_hosts 点名才查：{sorted(guard.guarded_hosts) or '空'}）"
+        f"（root 账号恒查；非 root 要看 guarded_hosts 点名或凭据里的 critical 标记：{sorted(guard.guarded_hosts) or '空'}）"
     )
     for alias, cred in sorted(creds.items()):
         pin, source = effective_pin(alias, cred)
         flags = []
+        if cred.disabled:
+            flags.append("已停用(disabled)")
         if not pin:
             flags.append("未固定指纹(pin_hostkey)")
         if cred.auth == "password" and not cred.password:
             flags.append("password为空")
+        if not cred.xfer:
+            flags.append("禁传文件")
         print(
-            f"  {alias:<8} {cred.username:<8} guard={'killlist' if G.applies(cred.privileged, alias, guard) else 'none':<8} "
+            f"  {alias:<8} {cred.username:<8} guard={'killlist' if G.applies(cred.privileged, alias, guard, cred.critical) else 'none':<8} "
             f"pin={source or '-':<11} elevate={'on' if cred.elevate else 'off':<4}({'+' if cred.elevate_password else '复用登录口令'}) {' '.join(flags)}"
         )
     try:

@@ -284,6 +284,10 @@ class GuardScope(unittest.TestCase):
         self.assertTrue(G.applies(False, "named", self.CFG))
         self.assertFalse(G.applies(False, "unlisted", self.CFG))
 
+    def test_critical_flag_guards_any_host(self):
+        self.assertTrue(G.applies(False, "whatever", self.CFG, critical=True))
+        self.assertFalse(G.applies(False, "whatever", self.CFG, critical=False))
+
     def test_nonroot_host_still_blocked_when_named(self):
         """非 root 只要点了名，判定内容与 root 主机完全一致。"""
         self.assertTrue(G.check("rm -rf /", self.CFG) is not None)

@@ -72,5 +72,17 @@
     "hostKey": "SHA256:<服务器指纹>",
     "shell_init": "/opt/miniconda3/etc/profile.d/conda.sh",
     "purpose": "每条 exec 前先 source 这段片段（conda/venv/自定义 PATH）；失败返回 exit 97 且 stderr 明说 shell_init 失败。需要读 profile 时改用 exec(..., login_shell=true)"
+  },
+
+  "example-flags": {
+    "address": "10.0.0.17",
+    "port": 22,
+    "username": "deploy",
+    "auth": "password",
+    "password": "<填口令>",
+    "hostKey": "SHA256:<服务器指纹>",
+    "critical": true,
+    "xfer": false,
+    "purpose": "能力位示例：critical=true 表示永远查 killlist（等价于写进 guarded_hosts）；xfer=false 表示只执行、禁止传文件；另有 disabled=true 可临时停用整台。三个字段都可以不写，默认 critical=false / xfer=true / disabled=false"
   }
 }

@@ -33,10 +33,16 @@
 uv run --quiet E:\Ilovestudy\MyWork\mcp\ssh-mcp\ssh_mcp.py doctor
 ```
 
-清单判定的离线用例（裸 python 即可，不需要 paramiko；21 例，含等价写法与「设计上不再防」的形态）：
+清单判定的离线用例（裸 python 即可，不需要 paramiko；含等价写法与「设计上不再防」的形态）：
 
 ```powershell
 python test_ssh_guard.py
+```
+
+主机清单读写的离线用例（原子写、备份轮转、字段校验、保留注释键、扫描导入）：
+
+```powershell
+python test_hostreg.py
 ```
 
 全文日志与回捞的离线用例（同样裸 python，不碰网络；24 例）：
@@ -65,11 +71,19 @@ uv run --quiet smoke_stdio.py
 
 ## 配
 
-1. `copy ssh_mcp_hosts.example.json ssh_mcp_hosts.json`，填真实凭据。**这个文件我不读不写**，是红线。
-   可用字段：`address` `port` `username` `auth`（`password`/`key`）`password` `key_path` `hostKey` `purpose`，外加提权三项 `elevate` `elevate_user` `elevate_password`（见「提权」节），以及环境初始化字段 `shell_init`（见「环境初始化」节）。
+1. `copy ssh_mcp_hosts.example.json ssh_mcp_hosts.json`，填真实凭据；或者直接用界面维护：`uv run hosts_gui.py`。**这个文件我不读不写**，是红线。
+   可用字段：`address` `port` `username` `auth`（`password`/`key`）`password` `key_path` `hostKey` `purpose`，提权三项 `elevate` `elevate_user` `elevate_password`（见「提权」节），环境初始化字段 `shell_init`（见「环境初始化」节），以及能力位 `disabled` `critical` `xfer`（见下一条）。
    旧字段 `rw_allowed` 已从模型里删掉；凭据文件里残留它会被静默忽略，不用你去清理（有用例钉着这个兼容行为）。
    `auth: "key"` 时 `key_path` 可省略，缺省按 `~/.ssh/{id_ed25519,id_rsa,id_ecdsa,id_dsa}` 顺序找。**带 passphrase 的文件私钥不支持**，此时改为问 ssh-agent 并取它的第一把 key（只取一把：逐把试认证会连着打远端的失败次数）。Windows 的 `ssh-agent` 服务默认是 Stopped/Disabled，要先 `Set-Service ssh-agent -StartupType Manual` 起服务再 `ssh-add`。
 2. `policy.json` 现在只剩三样：`defaults`（超时、输出上限与传输预算）、`killlist`（72 条不可逆动作清单）、`guarded_hosts`（非 root 主机里哪些也要查清单）。
+   凭据里每台还能带三个能力位（都由你自己维护，界面里是复选框）：
+
+   | 字段 | 作用 |
+   |---|---|
+   | `disabled: true` | 临时停用这台：所有工具在**建立连接前**就拒（`reason: host_disabled`），不用删条目 |
+   | `critical: true` | 这台**永远查 killlist**，等价于把别名写进 `guarded_hosts`（`list_hosts` 显示 `guard_reason: "critical 标记"`） |
+   | `xfer: false` | 只执行、**禁止传文件**：`put_file`/`get_file` 直接拒（`reason: xfer_disabled`）；`xfer_stat` 只读元数据仍可用 |
+
 3. Qoder 里加 MCP（或手工写进 MCP 配置）：
 
 ```json
@@ -92,10 +106,27 @@ uv run --quiet smoke_stdio.py
 - 凭据文件里已钉过 `hostKey` 且与实际不符 → 工具**拒绝覆盖**（返回 `writable: false`），那必须是主机重装或真中间人，由人自己改凭据文件。
 - `hostkeys.json` 只给凭据文件没钉的主机兜底；凭据里钉过就以凭据为准（`list_hosts` 的 `pin_source` 会告诉你是哪边）。
 
-## 批量补齐主机（gen_hosts.py）
+## 主机配置界面（hosts_gui.py）
 
-`uv run gen_hosts.py` 扫本机 `~/.ssh/known_hosts`（本机 ssh 过的主机）与 `~/.ssh/config`，把凭据文件里还没有的主机（按地址去重）生成到 `ssh_mcp_hosts.candidates.json`：`address` / `port` / `hostKey` 自动填（指纹取 known_hosts 里该机的 ed25519，与 paramiko 首选算法一致），`username` 能从 ssh config 带出的也带上，**`password` 留空给人**。核对后把条目粘进 `ssh_mcp_hosts.json` 即可（`_` 开头的键服务端会忽略）。
-`--merge` 只增不改地并入凭据文件（先自动备份；凭据 JSON 坏了直接拒跑）——**这个命令建议你自己运行**。
+```powershell
+uv run hosts_gui.py
+```
+
+tkinter 窗口，专门维护主机清单——**不经过 MCP，AI 碰不到**（凭据文件仍然只有你能改）：
+
+- 左侧列表 + 右侧表单，增 / 改 / 复制 / 删除 / 停用主机；保存前自动备份 `<文件名>.bak-<时间戳>`（留最近 10 份），写入是原子的（临时文件 + `os.replace`），正在跑的服务不会读到半截 JSON。
+- **密码框留空＝沿用原口令**，打开时不回填明文；只有填了才覆盖。
+- **探测指纹**：只做密钥交换、不发送任何凭据，显示出指纹让你核对，确认后填入 `hostKey`，点保存才落盘。与已钉指纹不符时拒绝覆盖。
+- **测试连接**：只跑固定探针（`/etc/os-release` 前两行 + `uname -m`），不是第二个终端。
+- **从 known_hosts / ssh config 导入**：列出本机 ssh 过的主机，勾选后并入，已在清单里的地址自动排除。
+- 能力位复选框：`disabled`（停用）、`critical`（恒查清单）、`xfer`（允许传文件）、`elevate`（允许提权）。
+
+界面逻辑都下沉在 `hostreg.py`（纯 stdlib、可离线测）；窗口只做绑定。无界面环境仍可用命令行：
+
+```powershell
+uv run gen_hosts.py            # 只列出候选，不写文件
+uv run gen_hosts.py --merge    # 把可导入的候选并入清单（先备份）
+```
 
 ## 提权（elevate）
 
@@ -135,7 +166,7 @@ sudo -S -p '' --user root -- sh -c '<原命令，含 cd 前缀>'
 
 ## 拦截边界（Agent 必读）
 
-`exec(host, command, cwd?, idle_timeout?, max_duration?, force?, elevate?, detach?, force_reason?)` 对任何命令一律放行，只在**受保护主机**上查下面这五类形态。受保护 = `username == "root"`，或别名被 `policy.json` 的 `guarded_hosts` 点名（非 root 也挡一手手滑，比如跑共享业务的 `66`），或本次调用带 `elevate=true`（一旦落到 root，破坏面和 root 账号同级，不因登录账号是 `qy` 而免检）。没点名的非 root 主机（当前是 `100`）零拦截。
+`exec(host, command, cwd?, idle_timeout?, max_duration?, force?, elevate?, detach?, force_reason?, login_shell?)` 对任何命令一律放行，只在**受保护主机**上查下面这五类形态。受保护 = `username == "root"`，或凭据里标了 `critical: true`，或别名被 `policy.json` 的 `guarded_hosts` 点名（非 root 也挡一手手滑，比如跑共享业务的 `66`），或本次调用带 `elevate=true`（一旦落到 root，破坏面和 root 账号同级，不因登录账号是 `qy` 而免检）。没点名的非 root 主机（当前是 `100`）零拦截。
 
 | 类别 | 条目 |
 |---|---|
