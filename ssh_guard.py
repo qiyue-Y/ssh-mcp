@@ -68,6 +68,8 @@ class GuardConfig:
     xfer_timeout_s: float = 1800.0
     max_transfer_bytes: int = 4 * 1024**3
     xfer_chunk_bytes: int = 1024 * 1024
+    # 目录传输的文件数上限：防止一次递归把服务拖死（总量另有 max_transfer_bytes 管）
+    xfer_max_files: int = 2000
     xfer_dir: str = ""
     # 后台任务（job）：保留期与并发上限
     job_retention_days: int = 7
@@ -324,6 +326,7 @@ def load_guard(data: dict | None) -> GuardConfig:
         xfer_timeout_s=float(defaults.get("xfer_timeout_s", 1800)),
         max_transfer_bytes=int(defaults.get("max_transfer_bytes", 4 * 1024**3)),
         xfer_chunk_bytes=int(defaults.get("xfer_chunk_bytes", 1024 * 1024)),
+        xfer_max_files=int(defaults.get("xfer_max_files", 2000)),
         xfer_dir=str(defaults.get("xfer_dir") or ""),
         job_retention_days=int(defaults.get("job_retention_days", 7)),
         job_max_concurrent=int(defaults.get("job_max_concurrent", 8)),

@@ -159,9 +159,17 @@
 
 ## P1-3 目录传输 `recursive=true`
 
-**状态：待办**
+**状态：已完成（2026-11-09）**
 
-**现状**
+**实测证据**
+- `put_file(recursive=true)` / `get_file(recursive=true)`：逐文件走同一套分片续传 + 两端 md5；空目录逐个建；软链与 FIFO/设备文件跳过并计数。
+- 每个目标文件单独过 `G.check_write_target`（不只看根目录），命中者进 `blocked` 列表、其余照传；`force=true` 才放行。
+- 预算：`defaults.xfer_max_files`（默认 2000）与总字节超限在开始前拒；总时长用 `xfer_timeout_s`，中途超时 `aborted` 并保留已传部分。
+- v1 与 `elevate` 互斥，明确返回 `elevate_recursive_unsupported`；不做 `rsync --delete`。
+- 离线：`test_connect_refusals.py` 90 例全绿（新增 7 条目录用例，覆盖空目录、软链、逐目标清单、覆盖前备份、文件数上限、远端非目录）。
+- 真机 100（`/tmp`）：含空目录的树上传 2 文件 / 3 目录，`find` 确认远端空目录存在；下载回来两个文件 md5 与原文一致、空目录重建；目录覆盖 `authorized_keys` 时先产生备份（备份内容 `oldkey`、目标变为 `newkey`）。远端临时目录与备份目录均已清理。Windows 本机建软链需要特权，软链跳过路径只有离线用例覆盖（未做真机验证）。
+
+**现状（原）**
 - `put_file`/`get_file` 只传单文件，目录要靠调用方自己 `tar`。
 
 **目标**

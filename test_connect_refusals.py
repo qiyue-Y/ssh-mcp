@@ -769,6 +769,7 @@ class SftpStub:
         self.files = dict(files or {})
         self.renamed = []
         self.posix = []
+        self.mkdirs = []
 
     def stat(self, path):
         if path not in self.files:
@@ -780,7 +781,7 @@ class SftpStub:
         return "/home/qy"
 
     def mkdir(self, path):
-        pass
+        self.mkdirs.append(path)
 
     def remove(self, path):
         self.files.pop(path, None)
@@ -1322,6 +1323,160 @@ class ShellInit(unittest.TestCase):
             M.execute("100", "rm /root/.ssh/authorized_keys")  # 触发写前备份
         self.assertEqual(len(calls), 2, "备份一次 + 原命令一次")
         self.assertFalse(calls[0], "备份命令不该 source shell_init")
+
+
+class _Attr:
+    def __init__(self, filename, mode, size=0):
+        self.filename = filename
+        self.st_mode = mode
+        self.st_size = size
+
+
+class SftpTreeStub(SftpStub):
+    """在文件桩上补目录与 listdir_attr，只够目录下载用。"""
+
+    def __init__(self, files=None, dirs=None):
+        super().__init__(files)
+        self.dirs = dict(dirs or {})
+
+    def stat(self, path):
+        if path in self.dirs:
+            return type("S", (), {"st_size": 0, "st_mode": 0o040755, "st_uid": 0, "st_gid": 0, "st_mtime": 0})()
+        return super().stat(path)
+
+    def listdir_attr(self, path):
+        if path not in self.dirs:
+            raise IOError(f"No such dir: {path}")
+        return self.dirs[path]
+
+
+class TreeTransfer(unittest.TestCase):
+    """目录传输：逐文件校验、空目录、软链跳过、每个目标都过清单。"""
+
+    CRED = dict(TransferWiring.CRED)
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="tree-wire-"))
+        self.src = self.tmp / "src"
+        (self.src / "sub").mkdir(parents=True)
+        (self.src / "empty").mkdir()
+        (self.src / "a.txt").write_bytes(b"aaa")
+        (self.src / "sub" / "b.txt").write_bytes(b"bbbb")
+        self.symlink_ok = True
+        try:
+            (self.src / "link.txt").symlink_to(self.src / "a.txt")
+            (self.src / "linkdir").symlink_to(self.src / "sub", target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.symlink_ok = False
+
+    @staticmethod
+    def _md5_from_stub(stub):
+        def fake(cred, pin, path, host, deadline):
+            return hashlib.md5(bytes(stub.files[path])).hexdigest()
+        return fake
+
+    def test_put_tree_transfers_files_and_creates_empty_dir(self):
+        write_hosts({"100": dict(self.CRED)})
+        stub = SftpStub()
+        with mock.patch.object(M, "_sftp_of", return_value=stub), \
+             mock.patch.object(M, "_remote_md5", side_effect=self._md5_from_stub(stub)):
+            r = M._tool_put_file("100", str(self.src), "/srv/dst", recursive=True)
+        self.assertTrue(r["verified"], str(r))
+        self.assertEqual(r["files"], 2)
+        self.assertEqual(bytes(stub.files["/srv/dst/a.txt"]), b"aaa")
+        self.assertEqual(bytes(stub.files["/srv/dst/sub/b.txt"]), b"bbbb")
+        self.assertTrue(any(p.endswith("/empty") for p in stub.mkdirs), "空目录也要建")
+        if self.symlink_ok:
+            self.assertEqual(r["skipped_symlink_count"], 2)
+            self.assertNotIn("/srv/dst/link.txt", stub.files)
+            self.assertNotIn("/srv/dst/linkdir/b.txt", stub.files)
+
+    def test_put_tree_requires_directory_and_rejects_elevate(self):
+        write_hosts({"100": dict(self.CRED)})
+        single = self.tmp / "one.txt"
+        single.write_bytes(b"x")
+        self.assertEqual(M._tool_put_file("100", str(single), "/srv/dst", recursive=True)["reason"], "local_not_dir")
+        self.assertEqual(
+            M._tool_put_file("100", str(self.src), "/srv/dst", recursive=True, elevate=True)["reason"],
+            "elevate_recursive_unsupported",
+        )
+
+    def test_put_tree_checks_every_target_against_the_killlist(self):
+        write_hosts({"guarded-user": dict(self.CRED)})
+        (self.src / "authorized_keys").write_bytes(b"key")
+        stub = SftpStub()
+        with mock.patch.object(M, "_sftp_of", return_value=stub), \
+             mock.patch.object(M, "_remote_md5", side_effect=self._md5_from_stub(stub)):
+            r = M._tool_put_file("guarded-user", str(self.src), "/srv/dst", recursive=True)
+        self.assertIn("/srv/dst/authorized_keys", r["blocked"])
+        self.assertNotIn("/srv/dst/authorized_keys", stub.files, "被拦的文件不能落盘")
+        self.assertEqual(r["files"], 2, "其余文件照常传")
+
+    def test_put_tree_backs_up_sensitive_target_before_overwrite(self):
+        """未点名的主机不拦敏感目标，但覆盖前仍要备份（与单文件 put 对齐）。"""
+        write_hosts({"100": dict(self.CRED)})
+        (self.src / "authorized_keys").write_bytes(b"newkey")
+        stub = SftpStub({"/srv/dst/authorized_keys": bytearray(b"oldkey")})
+        calls = []
+
+        def run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False, login_shell=False, shell_init=False):
+            calls.append(command)
+            spill.close()
+            return M.RunResult(exit_code=0, stdout="", stderr="", truncated=False, timed_out=None,
+                               output_id=spill.run_id, stats=spill.stats())
+
+        with mock.patch.object(M, "_sftp_of", return_value=stub), \
+             mock.patch.object(M, "run_command", run), \
+             mock.patch.object(M, "_remote_md5", side_effect=self._md5_from_stub(stub)):
+            r = M._tool_put_file("100", str(self.src), "/srv/dst", recursive=True, overwrite=True)
+        self.assertTrue(r["verified"], str(r))
+        self.assertTrue(any("cp -a --" in c for c in calls), "覆盖前必须备份旧内容")
+        self.assertTrue(r.get("backups"))
+        self.assertEqual(bytes(stub.files["/srv/dst/authorized_keys"]), b"newkey")
+
+    def test_put_tree_respects_file_count_limit(self):
+        write_hosts({"100": dict(self.CRED)})
+        with mock.patch.object(M.GUARD.get(), "xfer_max_files", 1), \
+             mock.patch.object(M, "_sftp_of", return_value=SftpStub()):
+            r = M._tool_put_file("100", str(self.src), "/srv/dst", recursive=True)
+        self.assertFalse(r["verified"])
+        self.assertEqual(r["reason"], "too_many_files")
+
+    def test_get_tree_pulls_files_and_skips_symlinks(self):
+        write_hosts({"100": dict(self.CRED)})
+        stub = SftpTreeStub(
+            files={
+                "/remote/a.txt": bytearray(b"aaa"),
+                "/remote/sub/b.txt": bytearray(b"bbbb"),
+            },
+            dirs={
+                "/remote": [
+                    _Attr("a.txt", 0o100644, 3),
+                    _Attr("sub", 0o040755),
+                    _Attr("link", 0o120777, 99),
+                    _Attr("fifo", 0o010644),
+                ],
+                "/remote/sub": [_Attr("b.txt", 0o100644, 4)],
+            },
+        )
+        dest = self.tmp / "dst"
+        with mock.patch.object(M, "_sftp_of", return_value=stub), \
+             mock.patch.object(M, "_remote_md5", side_effect=self._md5_from_stub(stub)):
+            r = M._tool_get_file("100", "/remote", str(dest), recursive=True)
+        self.assertTrue(r["verified"], str(r))
+        self.assertEqual(r["files"], 2)
+        self.assertEqual((dest / "a.txt").read_bytes(), b"aaa")
+        self.assertEqual((dest / "sub" / "b.txt").read_bytes(), b"bbbb")
+        self.assertTrue((dest / "sub").is_dir())
+        self.assertEqual(r["skipped_symlink_count"], 2, "软链与 FIFO 都不搬")
+
+    def test_get_tree_refuses_when_remote_is_not_a_directory(self):
+        write_hosts({"100": dict(self.CRED)})
+        stub = SftpTreeStub(files={"/remote/a.txt": bytearray(b"aaa")})
+        with mock.patch.object(M, "_sftp_of", return_value=stub):
+            r = M._tool_get_file("100", "/remote/a.txt", str(self.tmp / "dst"), recursive=True)
+        self.assertFalse(r["verified"])
+        self.assertEqual(r["reason"], "remote_not_dir")
 
 
 if __name__ == "__main__":

@@ -112,8 +112,8 @@ def main() -> int:
             failures.append("pin_hostkey 缺 trust 参数")
         if "only_risky" not in schemas.get("audit_tail", {}):
             failures.append("audit_tail 缺 only_risky 参数")
-        for name, params in (("put_file", ("overwrite", "force", "elevate", "restart", "mode", "force_reason")),
-                             ("get_file", ("overwrite", "elevate", "restart", "local"))):
+        for name, params in (("put_file", ("overwrite", "force", "elevate", "restart", "mode", "force_reason", "recursive")),
+                             ("get_file", ("overwrite", "elevate", "restart", "local", "recursive"))):
             for p in params:
                 if p not in schemas.get(name, {}):
                     failures.append(f"{name} 缺 {p} 参数")

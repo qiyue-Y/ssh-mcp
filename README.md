@@ -69,7 +69,7 @@ uv run --quiet smoke_stdio.py
    可用字段：`address` `port` `username` `auth`（`password`/`key`）`password` `key_path` `hostKey` `purpose`，外加提权三项 `elevate` `elevate_user` `elevate_password`（见「提权」节），以及环境初始化字段 `shell_init`（见「环境初始化」节）。
    旧字段 `rw_allowed` 已从模型里删掉；凭据文件里残留它会被静默忽略，不用你去清理（有用例钉着这个兼容行为）。
    `auth: "key"` 时 `key_path` 可省略，缺省按 `~/.ssh/{id_ed25519,id_rsa,id_ecdsa,id_dsa}` 顺序找。**带 passphrase 的文件私钥不支持**，此时改为问 ssh-agent 并取它的第一把 key（只取一把：逐把试认证会连着打远端的失败次数）。Windows 的 `ssh-agent` 服务默认是 Stopped/Disabled，要先 `Set-Service ssh-agent -StartupType Manual` 起服务再 `ssh-add`。
-2. `policy.json` 现在只剩三样：`defaults`（超时与输出上限）、`killlist`（72 条不可逆动作清单）、`guarded_hosts`（非 root 主机里哪些也要查清单）。
+2. `policy.json` 现在只剩三样：`defaults`（超时、输出上限与传输预算）、`killlist`（72 条不可逆动作清单）、`guarded_hosts`（非 root 主机里哪些也要查清单）。
 3. Qoder 里加 MCP（或手工写进 MCP 配置）：
 
 ```json
@@ -160,8 +160,8 @@ sudo -S -p '' --user root -- sh -c '<原命令，含 cd 前缀>'
 - `list_hosts(brief?)` —— 主机、`pin_source`、是否查清单、限额。`brief=true` 只回短字段（不带每台的 limits 与全量 killlist），省上下文。不含密码。
 - `exec(host, command, cwd?, idle_timeout?, max_duration?, force?, elevate?, detach?, force_reason?, login_shell?)` —— 离散命令。`cwd` 由服务端按主机记忆：单发一条 `cd <目录>`（或光一个 `cd` 回 home）验活成功后写入，后续命令自动从该目录开始；`cd X && cmd` 复合形态只影响本条。被拦下时不建立连接。`elevate=true` 以 root 跑这一条（凭据里得先给这台开 `elevate`）。`detach=true` 丢后台跑并立刻返回 `job_id`（见「后台任务」一节）。`force_reason` 是 `force=true` 时写进审计的一句原因。`login_shell=true` 用 `bash -lc` 跑这一条（见「环境初始化」）。
 - `pin_hostkey(host, trust?)` —— 探测主机指纹；`trust=true` 才写 `hostkeys.json`。
-- `put_file(host, local, remote, overwrite?, force?, elevate?, restart?, mode?, force_reason?)` —— 本机 → 远端，分片续传 + md5。
-- `get_file(host, remote, local?, overwrite?, elevate?, restart?)` —— 远端 → 本机，落 `defaults.xfer_dir`。
+- `put_file(host, local, remote, overwrite?, force?, elevate?, restart?, mode?, force_reason?, recursive?)` —— 本机 → 远端，分片续传 + md5。`recursive=true` 传整棵目录（见「目录传输」）。
+- `get_file(host, remote, local?, overwrite?, elevate?, restart?, recursive?)` —— 远端 → 本机，落 `defaults.xfer_dir`。`recursive=true` 拉整棵目录。
 - `xfer_stat(host, remote)` —— 远端 size/mode/uid/mtime，传前判断该不该传（省一次 `ls -l` 文本解析）。
 - `job_status(host, job_id, offset?, max_bytes?)` —— 读后台任务的状态与输出增量（`offset_next` 供下次只取新增）。
 - `job_kill(host, job_id)` —— 停后台任务：进程组 SIGTERM→5 秒后 SIGKILL，带队里子进程树，杀前核对 `job_is_ours`。
@@ -257,6 +257,20 @@ paramiko 默认把数据切成 32KB 的 SFTP 请求（`SFTPFile.MAX_REQUEST_SIZE
 ### 校验
 
 传完在**两端各算一次整文件 md5**，不符就不 rename、不删 part、返回 `verified: false` 加续传提示。远端 md5 用 `md5sum`（实测 0.12s / 200MB），而不是把文件读回来算 —— 后者按 11 MB/s 要 18s。
+
+### 目录传输（recursive=true）
+
+`put_file(..., recursive=true)` / `get_file(..., recursive=true)` 传整棵目录，不新增工具：
+
+- **逐文件**走上面同一套分片续传 + 两端 md5；中断后重调同一参数，已完成的文件跳过、未完成的从缺口续传。
+- 空目录也会建（上传逐个 `mkdir`，下载按远端目录树补建）。
+- **符号链接与 FIFO/设备文件一律跳过**：不跟随链接目标（可能是 `/etc`），也不给 FIFO 读内容（会挂住等写者）。返回值里给 `skipped_symlink_count` 与前 20 个名字。
+- **每个目标文件都过敏感路径清单**（不只看根目录）：目录里混进 `authorized_keys` 会被单文件拦下，其余照传；`force=true` 才放行。覆盖已存在的敏感文件前同样先备份（与单文件 put 一致），备份路径进 `backups` 列表。
+- 默认不覆盖已存在的文件（`overwrite=true` 才覆盖），**不做 `rsync --delete`**：远端多余文件不动，删除永远是显式操作。
+- 预算是整次调用的：文件数 ≤ `defaults.xfer_max_files`（默认 2000）、总字节 ≤ `max_transfer_bytes`、总时长 ≤ `xfer_timeout_s`。任一项超了会在开始前拒（文件数/总量）或中途 `aborted`（时长）。
+- v1 与 `elevate` 互斥：目录里逐文件的暂存命名与提权路径会互相干扰，明确拒绝并提示先 `tar`。
+
+真机验证（100，`/tmp`）：含子目录与空目录的树，上传 2 文件 / 3 目录、下载回来两个文件 md5 均与原文一致、空目录按原样重建。
 
 ### 传输不能成为清单的绕过口
 

@@ -93,12 +93,13 @@
    - `restart=true` 在 `elevate` 路径上是**空操作** —— 它删的是非提权那条 part 名（`<目标>.sshmcp-part`），而提权走 `~/.sshmcp-xfer/<名>.sshmcp-part`，于是 3MB 的旧暂存被当"已传部分"静默复用。修法是让提权路径也调 `X.part_path_for()`（命名只有一处来源），并把删除挪到 part 解析之后。真机分别验了两条分支：默认续传 `resumed_from=7340096` 保留已传片；带 restart `resumed_from=0` 从头传，两者最终 md5 都等于原文。
    - part 比新源文件还大（源被重新生成过）时，旧前缀不对应任何有效状态却会被当已传部分 → `push`/`pull` 现在遇到 `base > size` 一律作废从头传。用例：`test_stale_part_larger_than_source_is_discarded`、`test_stale_local_part_larger_than_remote_is_discarded`。
 
-## 2026-09-29 · 传输没有跨调用取消，也没有目录批量（P2，按用户决定不做）
+## 2026-09-29 · 传输没有跨调用取消（P2，按用户决定不做）；目录批量已补
 
-- **症状**：中断的传输只能由"用同一组参数再调一次"续传，无法取消别人发起的那次；目录要靠调用方自己 `exec tar czf` 再传归档。
-- **根因**：v1 不设 job id（`xfer_timeout_s` 到点自己停，part 留在原地）。用户明确"v1 只做单文件"。
+- **症状（仅剩取消）**：中断的传输只能由"用同一组参数再调一次"续传，无法取消别人发起的那次。
+- **根因**：v1 不设 job id（`xfer_timeout_s` 到点自己停，part 留在原地）。
 - **最小复现**：`put_file` 超时返回 `aborted` + `part`，再调一次走 `resumed_from`；想推掉别人的传输只能 `restart=true` 从头传。
 - **要不要修**：真要取消/进度得加 job 表和一个 `xfer_cancel(job_id)`，那是另一套状态机。等有并发传大文件的实际痛点再说。
+- **目录批量（2026-11-09 已补）**：`put_file`/`get_file` 的 `recursive=true` 可传整棵树，逐文件续传 + md5、空目录重建、软链与 FIFO 跳过、逐目标清单检查；不再需要调用方自己 `tar`。
 - **未验部分**：66 的传输路径没在真机跑过（真机限定 100）。
 
 ## 2026-09-29 · 提权口令错时会挂到 idle 超时（已修，勿回退）

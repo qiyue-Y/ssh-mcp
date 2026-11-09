@@ -6,6 +6,7 @@
     "xfer_dir": "D:\\temporaryfile\\download",
     "xfer_timeout_s": 1800,
     "xfer_chunk_bytes": 1048576,
+    "xfer_max_files": 2000,
     "max_transfer_bytes": 4294967296,
     "job_retention_days": 7,
     "job_max_concurrent": 8

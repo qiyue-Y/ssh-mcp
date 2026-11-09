@@ -404,8 +404,8 @@ _AUDIT_ARGS = {
     "list_hosts": ("brief",),
     "exec": ("host", "command", "cwd", "idle_timeout", "max_duration", "force", "elevate", "detach", "force_reason", "login_shell"),
     "pin_hostkey": ("host", "trust"),
-    "put_file": ("host", "local", "remote", "overwrite", "force", "elevate", "restart", "mode", "force_reason"),
-    "get_file": ("host", "remote", "local", "overwrite", "elevate", "restart"),
+    "put_file": ("host", "local", "remote", "overwrite", "force", "elevate", "restart", "mode", "force_reason", "recursive"),
+    "get_file": ("host", "remote", "local", "overwrite", "elevate", "restart", "recursive"),
     "xfer_stat": ("host", "remote"),
     "session_reset": ("host",),
     "audit_tail": ("host", "limit", "only_risky"),
@@ -1351,7 +1351,8 @@ def _transfer_guard(cred: HostCred, alias: str, remote: str, elevate: bool, forc
 
 
 def _tool_put_file(host: str, local: str, remote: str, overwrite: bool = False, force: bool = False,
-                   elevate: bool = False, restart: bool = False, mode: str = "", force_reason: str = "") -> dict:
+                   elevate: bool = False, restart: bool = False, mode: str = "", force_reason: str = "",
+                   recursive: bool = False) -> dict:
     guard = GUARD.get()
     refusal, cred, pin = _preflight(host, f"<put> {local} -> {remote}")
     if refusal is not None:
@@ -1363,16 +1364,23 @@ def _tool_put_file(host: str, local: str, remote: str, overwrite: bool = False, 
         return blocked
 
     src = Path(local).expanduser()
-    if not src.is_file():
+    if recursive:
+        if elevate:
+            return _block(host, f"<put> {remote}", "elevate_recursive_unsupported", "no_elevate_recursive",
+                          "目录传输 v1 不支持 elevate：先在远端 tar 解包，或对单个文件用 elevate=true")
+        if not src.is_dir():
+            return _block(host, f"<put> {remote}", "local_not_dir", "no_local_dir", f"本机没有目录：{src}")
+    elif not src.is_file():
         return _block(host, f"<put> {remote}", "local_missing", "no_local", f"本机没有文件：{src}")
-    size = src.stat().st_size
-    if size > guard.max_transfer_bytes:
+    size = None if recursive else src.stat().st_size
+    if size is not None and size > guard.max_transfer_bytes:
         return _block(host, f"<put> {remote}", "too_large", "max_transfer_bytes",
                       f"{size} 字节 > 上限 {guard.max_transfer_bytes}（policy.json 的 defaults.max_transfer_bytes）")
 
     try:
         intent = {"host": host, "command": f"<put> {src} -> {remote}", "event": "intent",
-                  "rule": "forced" if force else "pass", "elevated": elevate or None, "bytes": size}
+                  "rule": "forced" if force else "pass", "elevated": elevate or None, "bytes": size,
+                  "recursive": recursive or None}
         if force:
             intent["force_reason"] = _force_reason(force_reason)
         audit(intent)
@@ -1390,6 +1398,13 @@ def _tool_put_file(host: str, local: str, remote: str, overwrite: bool = False, 
     sftp = None
     try:
         sftp = _sftp_of(host, cred, pin)
+        if recursive:
+            out.update(_put_tree(host, cred, pin, sftp, src, remote, overwrite, force, restart, mode, guard, deadline))
+            audit({"host": host, "command": f"<put> {src} -> {remote}", "event": "transferred",
+                   "recursive": True, "files": out["files"], "bytes": out["bytes"],
+                   "dirs": out["dirs"], "blocked": len(out["blocked"]), "failed": len(out["failed"]),
+                   "elevated": elevate or None})
+            return out
         existing = _remote_stat_size(sftp, remote)
         if existing is not None and not overwrite:
             out["hint"] = f"远端已存在 {remote}（{existing} 字节）。确认要覆盖就带 overwrite=true"
@@ -1472,13 +1487,16 @@ def _tool_put_file(host: str, local: str, remote: str, overwrite: bool = False, 
 
 
 def _tool_get_file(host: str, remote: str, local: str = "", overwrite: bool = False,
-                   elevate: bool = False, restart: bool = False) -> dict:
+                   elevate: bool = False, restart: bool = False, recursive: bool = False) -> dict:
     guard = GUARD.get()
     refusal, cred, pin = _preflight(host, f"<get> {remote}")
     if refusal is not None:
         return refusal
     if elevate and not cred.elevate:
         return _block(host, f"<get> {remote}", "elevate_not_configured", "no_elevate", f"凭据文件里为 {host} 打开 elevate")
+    if recursive and elevate:
+        return _block(host, f"<get> {remote}", "elevate_recursive_unsupported", "no_elevate_recursive",
+                      "目录传输 v1 不支持 elevate：先在远端 tar 打包再下单个文件")
 
     root = xfer_dir(guard)
     dest = Path(local).expanduser() if local else root / Path(remote).name
@@ -1487,7 +1505,7 @@ def _tool_get_file(host: str, remote: str, local: str = "", overwrite: bool = Fa
 
     try:
         audit({"host": host, "command": f"<get> {remote} -> {dest}", "event": "intent",
-               "rule": "pass", "elevated": elevate or None})
+               "rule": "pass", "elevated": elevate or None, "recursive": recursive or None})
     except OSError as exc:
         return _block(host, f"<get> {remote}", "audit_write_failed", "audit_unwritable", f"审计目录不可写：{exc}")
 
@@ -1500,6 +1518,16 @@ def _tool_get_file(host: str, remote: str, local: str = "", overwrite: bool = Fa
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
         sftp = _sftp_of(host, cred, pin)
+        if recursive:
+            if not _remote_is_dir(sftp, remote):
+                return {**out, "verified": False, "reason": "remote_not_dir",
+                        "hint": f"远端 {remote} 不是目录；单文件请去掉 recursive=true"}
+            dest.mkdir(parents=True, exist_ok=True)
+            out.update(_get_tree(host, cred, pin, sftp, remote, dest, overwrite, restart, guard, deadline))
+            audit({"host": host, "command": f"<get> {remote} -> {dest}", "event": "transferred",
+                   "recursive": True, "files": out["files"], "bytes": out["bytes"],
+                   "dirs": out["dirs"], "failed": len(out["failed"])})
+            return out
         src = remote
         if elevate:
             stage = f"{_remote_home(sftp)}/{STAGING_DIRNAME}"
@@ -1622,6 +1650,28 @@ def _ensure_remote_dir(sftp, path: str) -> None:
         pass  # 已存在是正常路径，报错交给后续写入
 
 
+def _ensure_remote_dir_deep(sftp, path: str) -> None:
+    """逐段建目录：目录传输的目标通常有多层子目录，sftp.mkdir 不递归。"""
+    if not path or path in ("/", "."):
+        return
+    parts = path.strip("/").split("/")
+    prefix = "/" if path.startswith("/") else ""
+    for part in parts:
+        prefix = f"{prefix}{part}"
+        try:
+            sftp.mkdir(prefix)
+        except IOError:
+            pass
+        prefix = f"{prefix}/"
+
+
+def _remote_is_dir(sftp, path: str) -> bool:
+    try:
+        return stat.S_ISDIR(getattr(sftp.stat(path), "st_mode", 0) or 0)
+    except IOError:
+        return False
+
+
 def _drop_remote(sftp, path: str) -> None:
     try:
         sftp.remove(path)
@@ -1651,6 +1701,212 @@ def _remote_md5(cred: HostCred, pin: str, path: str, alias: str, deadline: float
 
 def _remote_rm(cred: HostCred, pin: str, path: str, alias: str, guard) -> None:
     run_command(cred, pin, f"rm -f -- {shlex.quote(path)}", "~", guard.idle_timeout_s, 60.0, _throw_spill(guard))
+
+
+# --------------------------------------------------------------------------------------
+# 目录传输（recursive=true）：逐文件走同一套分片续传与 md5，不做 rsync --delete
+# --------------------------------------------------------------------------------------
+
+_TREE_LIST_LIMIT = 20  # 返回值里每类问题最多列 20 条，其余只看计数
+
+
+def _walk_local_tree(root: Path) -> tuple[list[tuple[Path, str]], list[str], list[str]]:
+    """遍历本机目录：返回 (文件[(路径, 相对路径)], 目录相对路径, 跳过的符号链接)。
+
+    followlinks=False 且文件软链也跳过：不把链接目标（可能是 /etc）带进传输。
+    """
+    files: list[tuple[Path, str]] = []
+    dirs: list[str] = []
+    skipped: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(dirpath)
+        rel_dir = "" if base == root else base.relative_to(root).as_posix()
+        dirs.append(rel_dir)
+        for name in list(dirnames):
+            if (base / name).is_symlink():
+                skipped.append(f"{rel_dir}/{name}" if rel_dir else name)
+                dirnames.remove(name)
+        for name in filenames:
+            full = base / name
+            if full.is_symlink():
+                skipped.append(f"{rel_dir}/{name}" if rel_dir else name)
+                continue
+            files.append((full, f"{rel_dir}/{name}" if rel_dir else name))
+    return files, dirs, skipped
+
+
+def _put_tree(host: str, cred: HostCred, pin: str, sftp, src_root: Path, remote_root: str,
+              overwrite: bool, force: bool, restart: bool, mode: str, guard, deadline: float) -> dict:
+    """把本机目录逐个文件推到远端。每个目标都过一遍敏感路径清单。"""
+    files, dirs, skipped = _walk_local_tree(src_root)
+    out: dict = {
+        "recursive": True, "files": 0, "bytes": 0, "dirs": 0,
+        "skipped_symlink_count": len(skipped),
+        "skipped_existing": [], "blocked": [], "failed": [],
+        "verified": True,
+    }
+    if skipped:
+        out["skipped_symlinks"] = skipped[:_TREE_LIST_LIMIT]
+    if len(files) > guard.xfer_max_files:
+        out.update({"verified": False, "reason": "too_many_files",
+                    "hint": f"{len(files)} 个文件 > 上限 {guard.xfer_max_files}（policy.json defaults.xfer_max_files）"})
+        return out
+    total = sum(f.stat().st_size for f, _ in files)
+    if total > guard.max_transfer_bytes:
+        out.update({"verified": False, "reason": "too_large",
+                    "hint": f"合计 {total} 字节 > 上限 {guard.max_transfer_bytes}"})
+        return out
+    out["bytes_total"] = total
+
+    policy = GUARD.get()
+    guarded = G.applies(cred.privileged, host, policy)
+
+    for rel_dir in dirs:
+        target = remote_root if not rel_dir else f"{remote_root.rstrip('/')}/{rel_dir}"
+        _ensure_remote_dir_deep(sftp, target)
+        out["dirs"] += 1
+
+    for local_path, rel in files:
+        remote_path = f"{remote_root.rstrip('/')}/{rel}"
+        if guarded and G.check_write_target(remote_path) is not None and not force:
+            out["blocked"].append(remote_path)
+            continue
+        try:
+            existing = _remote_stat_size(sftp, remote_path)
+            if existing is not None and not overwrite:
+                out["skipped_existing"].append(remote_path)
+                continue
+            if existing is not None and G.check_write_target(remote_path) is not None:
+                # 与单文件 put 对齐：覆盖敏感文件前先备份，失败就不覆盖这一个
+                bdir, berr = _backup_remote_targets(host, cred, pin, [remote_path], "~", guard)
+                if berr:
+                    out["failed"].append({"path": remote_path, "reason": f"backup_failed: {berr}"})
+                    out["verified"] = False
+                    continue
+                out.setdefault("backups", []).append(bdir)
+            part = X.part_path_for(remote_path)
+            if restart:
+                _drop_remote(sftp, part)
+            tr = X.push(sftp, str(local_path), part, chunk=guard.xfer_chunk_bytes,
+                        deadline=deadline, total_limit=guard.max_transfer_bytes)
+            local_md5 = X.md5_of_file(str(local_path), deadline=deadline)
+            remote_md5 = _remote_md5(cred, pin, part, host, deadline)
+            if remote_md5 is None or local_md5 != remote_md5:
+                out["failed"].append({"path": remote_path, "reason": "md5_mismatch", "part": part})
+                out["verified"] = False
+                continue
+            sftp.chmod(part, int(mode or "0644", 8))
+            _remote_rename(sftp, part, remote_path, overwrite)
+            out["files"] += 1
+            out["bytes"] += local_path.stat().st_size
+            out.setdefault("resumed_from", 0)
+            out["resumed_from"] += tr.resumed_from
+        except X.TransferAborted as exc:
+            out.update({"verified": False, "reason": "aborted", "aborted": str(exc),
+                        "hint": "已传部分保留，重调同一参数从缺口续传"})
+            break
+        except Exception as exc:  # noqa: BLE001
+            out["failed"].append({"path": remote_path, "reason": f"{type(exc).__name__}: {exc}"})
+            out["verified"] = False
+    for key in ("skipped_existing", "blocked", "failed"):
+        if len(out[key]) > _TREE_LIST_LIMIT:
+            out[f"{key}_truncated"] = len(out[key])
+            out[key] = out[key][:_TREE_LIST_LIMIT]
+    return out
+
+
+def _walk_remote_tree(sftp, root: str, max_files: int) -> tuple[list[tuple[str, str, int]], list[str], list[str]]:
+    """远端目录遍历：返回 (文件[(相对路径, 绝对路径, 大小)], 目录, 跳过的特殊文件)。"""
+    files: list[tuple[str, str, int]] = []
+    dirs: list[str] = []
+    skipped: list[str] = []
+    stack = [("", root)]
+    while stack:
+        rel_dir, path = stack.pop()
+        dirs.append(rel_dir)
+        for attr in sftp.listdir_attr(path):
+            mode = attr.st_mode or 0
+            rel = attr.filename if not rel_dir else f"{rel_dir}/{attr.filename}"
+            full = f"{path.rstrip('/')}/{attr.filename}"
+            if stat.S_ISLNK(mode):
+                skipped.append(rel)
+            elif stat.S_ISDIR(mode):
+                stack.append((rel, full))
+            elif stat.S_ISREG(mode):
+                files.append((rel, full, attr.st_size))
+                if len(files) > max_files:
+                    raise ValueError(f"文件数超过上限 {max_files}")
+            else:
+                skipped.append(rel)  # FIFO / socket / 设备文件不搬
+    return files, dirs, skipped
+
+
+def _get_tree(host: str, cred: HostCred, pin: str, sftp, remote_root: str, dest_root: Path,
+              overwrite: bool, restart: bool, guard, deadline: float) -> dict:
+    """把远端目录逐个文件拉回本机。软链与特殊文件跳过，不给它们读内容（会挂住）。"""
+    out: dict = {
+        "recursive": True, "files": 0, "bytes": 0, "dirs": 0, "skipped_symlink_count": 0,
+        "skipped_existing": [], "failed": [], "verified": True,
+    }
+    try:
+        files, dirs, skipped = _walk_remote_tree(sftp, remote_root, guard.xfer_max_files)
+    except ValueError as exc:
+        out.update({"verified": False, "reason": "too_many_files", "hint": str(exc)})
+        return out
+    out["skipped_symlink_count"] = len(skipped)
+    if skipped:
+        out["skipped_symlinks"] = skipped[:_TREE_LIST_LIMIT]
+
+    total = sum(size for _, _, size in files)
+    out["bytes_total"] = total
+    if total > guard.max_transfer_bytes:
+        out.update({"verified": False, "reason": "too_large",
+                    "hint": f"合计 {total} 字节 > 上限 {guard.max_transfer_bytes}"})
+        return out
+    free = shutil.disk_usage(str(dest_root)).free
+    if free < total:
+        out.update({"verified": False, "reason": "local_no_space",
+                    "hint": f"{dest_root} 只剩 {free} 字节，放不下 {total}"})
+        return out
+
+    for rel_dir in dirs:
+        (dest_root / rel_dir).mkdir(parents=True, exist_ok=True)
+        out["dirs"] += 1
+
+    for rel, remote_path, size in files:
+        local_path = dest_root / Path(rel)
+        try:
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            if local_path.exists() and not overwrite:
+                out["skipped_existing"].append(rel)
+                continue
+            part = local_path.with_name(local_path.name + X.PART_SUFFIX)
+            if restart and part.exists():
+                part.unlink()
+            tr = X.pull(sftp, remote_path, str(part), chunk=guard.xfer_chunk_bytes,
+                        deadline=deadline, total_limit=guard.max_transfer_bytes)
+            local_md5 = X.md5_of_file(str(part), deadline=deadline)
+            if size > 0:
+                remote_md5 = _remote_md5(cred, pin, remote_path, host, deadline)
+                if remote_md5 is None or local_md5 != remote_md5:
+                    out["failed"].append({"path": rel, "reason": "md5_mismatch", "part": str(part)})
+                    out["verified"] = False
+                    continue
+            os.replace(part, local_path)
+            out["files"] += 1
+            out["bytes"] += tr.bytes
+        except X.TransferAborted as exc:
+            out.update({"verified": False, "reason": "aborted", "aborted": str(exc),
+                        "hint": "已传部分保留，重调同一参数从缺口续传"})
+            break
+        except Exception as exc:  # noqa: BLE001
+            out["failed"].append({"path": rel, "reason": f"{type(exc).__name__}: {exc}"})
+            out["verified"] = False
+    for key in ("skipped_existing", "failed"):
+        if len(out[key]) > _TREE_LIST_LIMIT:
+            out[f"{key}_truncated"] = len(out[key])
+            out[key] = out[key][:_TREE_LIST_LIMIT]
+    return out
 
 
 # --------------------------------------------------------------------------------------
@@ -1930,7 +2186,9 @@ def build_server():
             "（建议同时用 force_reason 写一句为什么，进审计）。"
             "远端已存在同名文件时默认拒绝，要覆盖带 overwrite=true。"
             "elevate=true 走两段式：先落到远端 ~/.sshmcp-xfer/ 再 sudo install 到目标（/root、/etc 只有这样才能写）。"
-            "上限取 policy.json 的 defaults.max_transfer_bytes（现 4GB）。"
+            "recursive=true 把本机目录整棵推上去：逐文件续传 + md5，空目录也建，符号链接与特殊文件跳过；"
+            "每个目标文件都过敏感路径清单；不做 rsync --delete，远端多余文件不动。v1 与 elevate 互斥。"
+            "上限取 policy.json 的 defaults.max_transfer_bytes 与 xfer_max_files。"
         ),
     )
     @_audited("put_file")
@@ -1944,11 +2202,12 @@ def build_server():
         restart: bool = False,
         mode: str = "",
         force_reason: str = "",
+        recursive: bool = False,
     ) -> dict:
         import anyio
 
         return await anyio.to_thread.run_sync(
-            lambda: _tool_put_file(host, local, remote, overwrite, force, elevate, restart, mode, force_reason)
+            lambda: _tool_put_file(host, local, remote, overwrite, force, elevate, restart, mode, force_reason, recursive)
         )
 
     @server.tool(
@@ -1957,6 +2216,8 @@ def build_server():
             "远端 -> 本机，落盘目录取 policy.json 的 defaults.xfer_dir（默认是系统下载目录），local 可覆盖。"
             "同样分片续传 + md5 校验；part 文件按目标名固定，中断后重调同一参数续传。"
             "读 root 才可见的文件用 elevate=true（服务端先 sudo cat 到暂存再取回）。"
+            "recursive=true 把远端目录整棵拉回：逐文件续传 + md5，空目录也建，符号链接与 FIFO 等特殊文件跳过；"
+            "同样受 max_transfer_bytes 与 xfer_max_files 限制，不做删除式同步。v1 与 elevate 互斥。"
         ),
     )
     @_audited("get_file")
@@ -1967,11 +2228,12 @@ def build_server():
         overwrite: bool = False,
         elevate: bool = False,
         restart: bool = False,
+        recursive: bool = False,
     ) -> dict:
         import anyio
 
         return await anyio.to_thread.run_sync(
-            lambda: _tool_get_file(host, remote, local, overwrite, elevate, restart)
+            lambda: _tool_get_file(host, remote, local, overwrite, elevate, restart, recursive)
         )
 
     @server.tool(
