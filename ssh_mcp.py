@@ -96,6 +96,7 @@ OUTPUT_ROOT = _path_from_env("SSHMCP_OUTPUT", HOME_DIR / "output")
 # 回给 Agent 的内联预算（字节）。全文在 output/ 里，想看随时 read_output 捞。
 INLINE_OUT = (4096, 4096)
 INLINE_ERR = (1024, 2048)
+BACKUPS_DIRNAME = ".sshmcp-backups"
 OUTPUT_KEEP_RUNS = int(os.environ.get("SSHMCP_OUTPUT_KEEP_RUNS", "200"))
 OUTPUT_KEEP_BYTES = int(os.environ.get("SSHMCP_OUTPUT_KEEP_BYTES", str(500 * 1024 * 1024)))
 OUTPUT_KEEP_DAYS = int(os.environ.get("SSHMCP_OUTPUT_KEEP_DAYS", "14"))
@@ -342,6 +343,23 @@ def audit_tail(alias: str | None, limit: int) -> list[dict]:
     return out
 
 
+_RISKY_EVENTS = frozenset({"blocked", "backup", "backup_failed", "error", "job_start_failed"})
+
+
+def _is_risky_audit(record: dict) -> bool:
+    """用户只该看的那 1%：被拦、强制越过、失败、异常、敏感写备份。"""
+    event = record.get("event")
+    if event in _RISKY_EVENTS:
+        return True
+    if record.get("rule") == "forced":
+        return True
+    if event == "result" and record.get("ok") is False:
+        return True
+    if event == "executed":
+        return record.get("exit_code") not in (0, None) or record.get("reason") not in (None, "ok")
+    return False
+
+
 def _remember_output_host(output_id: str | None, host: str | None) -> None:
     """记 output_id 属于哪台主机，供 read_output 的审计补 host。"""
     if not output_id or not host:
@@ -380,13 +398,13 @@ def _host_of_output(output_id: str | None) -> str | None:
 # 每次工具调用统一留痕：入口记 call，出口记 result/error，大内容只记引用不复制。
 _AUDIT_ARGS = {
     "list_hosts": ("brief",),
-    "exec": ("host", "command", "cwd", "idle_timeout", "max_duration", "force", "elevate", "detach"),
+    "exec": ("host", "command", "cwd", "idle_timeout", "max_duration", "force", "elevate", "detach", "force_reason"),
     "pin_hostkey": ("host", "trust"),
-    "put_file": ("host", "local", "remote", "overwrite", "force", "elevate", "restart", "mode"),
+    "put_file": ("host", "local", "remote", "overwrite", "force", "elevate", "restart", "mode", "force_reason"),
     "get_file": ("host", "remote", "local", "overwrite", "elevate", "restart"),
     "xfer_stat": ("host", "remote"),
     "session_reset": ("host",),
-    "audit_tail": ("host", "limit"),
+    "audit_tail": ("host", "limit", "only_risky"),
     "read_output": ("output_id", "stream", "mode", "start", "end", "pattern", "limit"),
     "job_status": ("host", "job_id", "offset", "max_bytes"),
     "job_kill": ("host", "job_id"),
@@ -397,7 +415,7 @@ _RESULT_FIELDS = (
     "host", "blocked", "reason", "hint", "error", "aborted", "exit_code", "timed_out",
     "truncated", "output_id", "bytes", "verified", "md5", "md5_local", "md5_remote", "md5_match",
     "state", "job_id", "pid", "result", "probed", "match", "pinned", "fingerprint", "key_type",
-    "address", "writable", "exists", "size", "mode", "found", "reset", "final", "part",
+    "address", "writable", "exists", "size", "mode", "found", "reset", "final", "part", "backup",
     "bytes_total", "lines_total", "matched", "count", "out_bytes", "offset_next", "elapsed_s",
     "rate_mb_s", "resumed_from",
 )
@@ -976,6 +994,53 @@ def _force_reason(reason: str) -> str | None:
     return (reason or "").strip()[:500] or None
 
 
+def _backup_target_name(target: str, index: int) -> str:
+    name = target.rstrip("/").rsplit("/", 1)[-1] or "target"
+    return f"{index:02d}-{name}"
+
+
+def _backup_remote_targets(alias, cred, pin, targets, cwd, guard, elevate: bool = False) -> tuple[str | None, str | None]:
+    """把 targets 中存在的文件备份到远端 ~/.sshmcp-backups/<时间戳>-<短id>/。
+
+    返回 (backup_dir, error)。error 非空时调用方必须拒绝执行原命令；
+    目标不存在不算失败（新建文件没有可备份的旧内容）。
+    """
+    uniq = list(dict.fromkeys(t for t in targets if t))
+    if not uniq:
+        return None, None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_dir = f"~/{BACKUPS_DIRNAME}/{stamp}-{uuid.uuid4().hex[:8]}"
+    parts = [f"mkdir -p {_cd_expr(backup_dir)} || exit 1"]
+    for index, target in enumerate(uniq):
+        dest = f"{backup_dir}/{_backup_target_name(target, index)}"
+        target_q = _cd_expr(target)
+        parts.append(f"if [ -e {target_q} ]; then cp -a -- {target_q} {_cd_expr(dest)} || exit 1; fi")
+    script = "; ".join(parts)
+    try:
+        spill = _throw_spill(guard)
+    except OSError as exc:
+        return None, f"output 目录不可写：{exc}"
+    try:
+        res = run_command(cred, pin, script, cwd, guard.idle_timeout_s, 600.0, spill, elevate)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"{type(exc).__name__}: {exc}"
+    if res.exit_code != 0:
+        detail = (res.stderr or res.stdout or "").strip()[:300]
+        error = f"备份失败（exit {res.exit_code}）：{detail or '没有输出'}"
+        try:
+            audit({"host": alias, "command": "<backup>", "event": "backup_failed",
+                   "targets": uniq, "error": error, "elevated": elevate or None})
+        except OSError as exc:
+            log(f"备份失败审计写入失败：{exc}")
+        return None, error
+    try:
+        audit({"host": alias, "command": "<backup>", "event": "backup",
+               "targets": uniq, "backup": backup_dir, "elevated": elevate or None})
+    except OSError as exc:
+        log(f"备份审计写入失败：{exc}")
+    return backup_dir, None
+
+
 def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None, force: bool = False, elevate: bool = False, detach: bool = False, force_reason: str = "") -> dict:
     refusal, cred, pin = _preflight(alias, command)
     if refusal is not None:
@@ -1019,8 +1084,17 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
     # 要确定性就显式传 cwd（见 DESIGN.md「并发控制」）。
     start_cwd = cwd or POOL.cwd(alias)
 
+    # 敏感文件写前备份：即使主机没被 killlist 点名，也要留一份可回滚的旧内容。
+    backup_dir = None
+    sensitive = G.sensitive_write_targets(command)
+    if sensitive:
+        backup_dir, backup_error = _backup_remote_targets(alias, cred, pin, sensitive, start_cwd, guard, elevate)
+        if backup_error:
+            return _block(alias, command, "backup_failed", "backup_failed",
+                          f"敏感文件备份失败，命令未执行：{backup_error}")
+
     if detach:
-        return _start_job(alias, command, cred, pin, guard, start_cwd, rule, idle_s)
+        return _start_job(alias, command, cred, pin, guard, start_cwd, rule, idle_s, backup_dir)
 
     # 全文落盘和审计同级：写不了就不执行，别把输出留在只有内存知道的地方
     try:
@@ -1057,10 +1131,14 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
     }
     if force:
         executed["force_reason"] = _force_reason(force_reason)
+    if backup_dir:
+        executed["backup"] = backup_dir
     audit(executed)
     out = _ok(alias, command, res, start_cwd, end_cwd, hit.rule if hit else None, elevate, cred.elevate_user or "root")
     if force:
         out["force_reason"] = _force_reason(force_reason)
+    if backup_dir:
+        out["backup"] = backup_dir
     return out
 
 
@@ -1299,6 +1377,16 @@ def _tool_put_file(host: str, local: str, remote: str, overwrite: bool = False, 
         if restart:
             _drop_remote(sftp, part)
 
+        # 覆盖敏感文件前先备份旧内容：put 走 SFTP 不经过命令串，这里的备份必须自己补。
+        backup_dir = None
+        if existing is not None and G.check_write_target(remote) is not None:
+            backup_dir, backup_error = _backup_remote_targets(host, cred, pin, [remote], "~", guard, elevate)
+            if backup_error:
+                out.update({"verified": False, "blocked": True, "reason": "backup_failed", "error": backup_error,
+                            "hint": "敏感文件备份失败，未覆盖原文件"})
+                return out
+            out["backup"] = backup_dir
+
         out["part"] = part
         have = _remote_stat_size(sftp, part) or 0
         tr = X.push(sftp, str(src), part, chunk=guard.xfer_chunk_bytes, deadline=deadline,
@@ -1335,6 +1423,8 @@ def _tool_put_file(host: str, local: str, remote: str, overwrite: bool = False, 
                        "seconds": out["seconds"], "elevated": elevate or None}
         if force:
             transferred["force_reason"] = _force_reason(force_reason)
+        if out.get("backup"):
+            transferred["backup"] = out["backup"]
         audit(transferred)
     except X.TransferAborted as exc:
         out.update({"verified": False, "aborted": str(exc), "hint": "part 已保留，重调同一参数即从缺口续传"})
@@ -1537,7 +1627,7 @@ def _remote_rm(cred: HostCred, pin: str, path: str, alias: str, guard) -> None:
 # --------------------------------------------------------------------------------------
 
 
-def _start_job(alias: str, command: str, cred: HostCred, pin: str, guard, start_cwd: str, rule: str, idle_s: float) -> dict:
+def _start_job(alias: str, command: str, cred: HostCred, pin: str, guard, start_cwd: str, rule: str, idle_s: float, backup: str | None = None) -> dict:
     """detach=true 的落点：把命令丢到远端后台，立刻带 job_id 回来。"""
     try:
         spill = _throw_spill(guard)
@@ -1563,11 +1653,16 @@ def _start_job(alias: str, command: str, cred: HostCred, pin: str, guard, start_
                 "error": "job_not_started", "reason": parsed["result"], "exit_code": res.exit_code,
                 "stdout": res.stdout[:300], "stderr": res.stderr[:300],
                 "hint": "远端没写出 pid 文件：看 stdout/stderr（NOPID 多为目录不可写或缺 setsid/nohup）"}
-    audit({"host": alias, "command": command, "event": "job_started", "rule": rule, "job_id": job_id,
-           "pid": parsed.get("pid"), "dir": directory or "~"})
+    started = {"host": alias, "command": command, "event": "job_started", "rule": rule,
+               "job_id": job_id, "pid": parsed.get("pid"), "dir": directory or "~"}
+    if backup:
+        started["backup"] = backup
+    audit(started)
     out = {"host": alias, "command": _echo(command), "job_id": job_id, "detached": True, "state": "running",
            "pid": parsed.get("pid"), "cwd": start_cwd,
            "next": f"job_status(host='{alias}', job_id='{job_id}') 看状态与输出；job_kill 停它"}
+    if backup:
+        out["backup"] = backup
     if rule == "forced":
         out["forced_rule"] = rule
     return out
@@ -1696,8 +1791,13 @@ def _tool_session_reset(host: str) -> dict:
     return {"host": host, "reset": True, "cwd": POOL.cwd(host)}
 
 
-def _tool_audit_tail(host: str | None = None, limit: int = 50) -> dict:
-    return {"records": audit_tail(host, min(max(1, limit), 500))}
+def _tool_audit_tail(host: str | None = None, limit: int = 50, only_risky: bool = False) -> dict:
+    n = min(max(1, int(limit)), 500)
+    if not only_risky:
+        return {"records": audit_tail(host, n)}
+    # 先多读一些再过滤：只看最后 n 条会把更早的被拦/失败记录漏掉
+    risky = [r for r in audit_tail(host, 500) if _is_risky_audit(r)]
+    return {"records": risky[:n], "only_risky": True}
 
 
 def _tool_read_output(
@@ -1852,10 +1952,10 @@ def build_server():
 
         return await anyio.to_thread.run_sync(lambda: _tool_session_reset(host))
 
-    @server.tool(name="audit_tail", description="读回最近的审计记录（含被拒命令），用于自查拒绝原因。")
+    @server.tool(name="audit_tail", description="读回最近的审计记录（含被拒命令），用于自查拒绝原因。only_risky=true 只回被拦、强制越过、失败、异常和敏感写备份。")
     @_audited("audit_tail")
-    async def _audit_tail(host: str | None = None, limit: int = 50) -> dict:
-        return _tool_audit_tail(host, limit)
+    async def _audit_tail(host: str | None = None, limit: int = 50, only_risky: bool = False) -> dict:
+        return _tool_audit_tail(host, limit, only_risky)
 
     @server.tool(
         name="read_output",

@@ -110,6 +110,8 @@ def main() -> int:
             failures.append("list_hosts 缺 brief 参数")
         if "trust" not in schemas.get("pin_hostkey", {}):
             failures.append("pin_hostkey 缺 trust 参数")
+        if "only_risky" not in schemas.get("audit_tail", {}):
+            failures.append("audit_tail 缺 only_risky 参数")
         for name, params in (("put_file", ("overwrite", "force", "elevate", "restart", "mode", "force_reason")),
                              ("get_file", ("overwrite", "elevate", "restart", "local"))):
             for p in params:

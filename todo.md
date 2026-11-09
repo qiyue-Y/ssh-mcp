@@ -89,7 +89,14 @@
 
 ## P1-1 敏感写前自动备份 + 审计只推异常
 
-**状态：待办**
+**状态：已完成（2026-11-09）**
+
+**实测证据**
+- `ssh_guard.sensitive_write_targets()` 覆盖写重定向、`tee`、`rm`/`cp`/`mv`/`install`/`ln`/`sed -i`/`truncate`；`cat`、`cp` 的源、无 `-i` 的 `sed`、`sed -n` 脚本都不误报；`mv` 两个敏感路径都会列出来。
+- `exec` 与 `put_file` 都会在写入前备份到远端 `~/.sshmcp-backups/<时间戳>-<短id>/`；备份失败返回 `{blocked:true, reason:"backup_failed"}`，原文件不动；返回值和审计带 `backup` 路径。
+- `audit_tail(only_risky=true)` 只回 blocked / forced / 失败 / 异常 / 备份；正常成功命令不出现。
+- 离线：`test_connect_refusals.py` 77 例全绿（新增 5 条备份 + 1 条 only_risky）；`test_ssh_guard.py` 35 例全绿（新增 2 条写目标清单用例）。
+- 真机 100（只用 `/tmp` 临时 `authorized_keys`）：`exec rm` 后备份文件 `00-authorized_keys` 存在；`put_file` 覆盖前备份内容为 `old`，覆盖成功；临时文件与备份目录已清理。
 
 **现状**
 - 改 `sshd_config`、`authorized_keys` 这类文件改坏了不可回滚；审计全文原样落盘，用户不会逐条看。

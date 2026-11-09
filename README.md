@@ -167,12 +167,21 @@ sudo -S -p '' --user root -- sh -c '<原命令，含 cd 前缀>'
 - `job_kill(host, job_id)` —— 停后台任务：进程组 SIGTERM→5 秒后 SIGKILL，带队里子进程树，杀前核对 `job_is_ours`。
 - `job_list(host, limit?)` —— 列最近的后台任务（running/exited/killed/lost），找孤儿用。
 - `session_reset(host)` —— 丢连接与 cwd 重来。若有命令在途则返回 `{reset:false, reason:"active_commands", active:N}`，不强杀在途命令。
-- `audit_tail(host?, limit?)` —— 回看最近审计（含被拦的）。所有工具调用都留 `call`/`result` 记录，可用 `call_id` 串联。
+- `audit_tail(host?, limit?, only_risky?)` —— 回看最近审计（含被拦的）。所有工具调用都留 `call`/`result` 记录，可用 `call_id` 串联。`only_risky=true` 只回被拦、强制越过、失败、异常与敏感写备份，正常成功的命令不出现。
 - `read_output(output_id, stream?, mode?, start?, end?, pattern?, limit?)` —— 按 `exec` 返回的 `output_id` 回捞全文。`mode`：`head`/`tail` 按行边界取，`grep` 返回**带行号**的命中（`pattern` 是**子串**匹配，不是正则），`lines` 取 `[start,end]` 行；单次上限 16KB。
 
 **没有** 交互 shell / PTY / 按键透传，这是故意的：netcatty 那套长会话死在 `terminal_execute` 全部挂起上。
 
 **并发**：同一台主机的首次连接只建一条；命令可以并行执行。`cwd` 是 per-host 的共享记忆，并发时最后写入者赢 —— 要确定性就显式传 `cwd=`。同一传输目标会串行（防止两个调用复用同一个 part），不同目标并行。`session_reset` 遇到在途命令会返回 busy，不强杀。
+
+## 敏感文件写前备份
+
+改 `authorized_keys`、`sshd_config`、`sudoers`、`fstab`、`shadow`、`passwd` 这类文件前，服务端先把现有内容备份到远端 `~/.sshmcp-backups/<时间戳>-<短id>/`，文件名带序号前缀（`00-authorized_keys`）。
+
+- 覆盖对象是**这条命令会写到的文件**：写重定向、`tee`、`rm`/`cp`/`mv`/`install`/`ln`/`sed`/`truncate` 的操作数；`put_file` 覆盖已存在的敏感目标也走同一条路。
+- **备份失败就不执行**：返回 `{blocked:true, reason:"backup_failed"}`，原文件保持不动。目标文件本来不存在不算失败（没有旧内容可备）。
+- 返回值带 `backup` 路径，审计记 `event:"backup"`（成功）或 `backup_failed`（失败），可用来恢复：`cp -a ~/.sshmcp-backups/<目录>/00-authorized_keys /root/.ssh/authorized_keys`。
+- 备份目录不会自动清理（它不是调试垃圾，而是回滚依据）；空间不够时自己删旧目录。
 
 ## 文件传输
 
@@ -289,7 +298,7 @@ SFTP 以登录用户身份写 `/root`、`/etc` 实测都是 `Permission denied`�
 
 - **审计只放元数据和引用**：命令原文、退出码、`output_id`、传输字节数与 md5 进审计；stdout/stderr/文件内容不复制进审计，它们留在 `output/` 与传输目标里，按引用回查。
 - 审计文件按天轮转：`audit/ssh-mcp.jsonl` → `audit/ssh-mcp.YYYYMMDD.jsonl`，保留 **14 天**（`SSHMCP_AUDIT_KEEP_DAYS`），路径可用 `SSHMCP_AUDIT` 覆盖。
-- `audit_tail(host?, limit?)` 会按时间倒序读当前文件与轮转文件；排障时先按 host/时间找到 `call_id`，再看这次调用的 `call`、工具内部记录与最终 `result`/`error`。
+- `audit_tail(host?, limit?, only_risky?)` 会按时间倒序读当前文件与轮转文件；排障时先按 host/时间找到 `call_id`，再看这次调用的 `call`、工具内部记录与最终 `result`/`error`。正常命令太多时用 `only_risky=true`，只看被拦、强制越过、失败、异常和敏感写备份。
 - `read_output` 本身没有 host 参数：服务端用内存里的 `output_id → host` 表补 host；服务重启后表为空时会回扫审计文件里同 `output_id` 的 `executed` 记录，所以按主机过滤也能看到回捞动作。
 - 审计写入失败时：`exec` 的 `intent` 仍是 fail closed（写不进就不执行）；包装层的 `call`/`result` 是尽力而为，只往 stderr 报错，不影响只读工具。
 

@@ -1152,5 +1152,112 @@ class Concurrency(unittest.TestCase):
         self.assertLessEqual(len(list(root.glob("*.out.log"))), 5)
 
 
+class BackupWiring(unittest.TestCase):
+    """敏感文件写前备份：成功时留路径，失败时拒绝执行原命令。"""
+
+    def setUp(self):
+        write_hosts({"100": dict(PINNED)})
+
+    @staticmethod
+    def _fake_run(fail_backup: bool = False):
+        calls = []
+
+        def run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False):
+            calls.append({"command": command, "cwd": cwd, "elevate": elevate})
+            spill.close()
+            if fail_backup and "sshmcp-backups" in command:
+                return M.RunResult(exit_code=1, stdout="", stderr="cp: Permission denied",
+                                   truncated=False, timed_out=None, output_id=spill.run_id, stats=spill.stats())
+            return M.RunResult(exit_code=0, stdout="", stderr="", truncated=False, timed_out=None,
+                               output_id=spill.run_id, stats=spill.stats())
+
+        return calls, run
+
+    def test_exec_backs_up_before_sensitive_write(self):
+        calls, run = self._fake_run()
+        with mock.patch.object(M, "run_command", run):
+            res = M.execute("100", "echo x > /root/.ssh/authorized_keys")
+        self.assertEqual(res["exit_code"], 0)
+        self.assertTrue(res["backup"].startswith("~/.sshmcp-backups/"))
+        self.assertEqual(len(calls), 2)
+        self.assertIn("mkdir -p", calls[0]["command"])
+        self.assertIn("cp -a --", calls[0]["command"])
+        self.assertEqual(calls[1]["command"], "echo x > /root/.ssh/authorized_keys")
+        backups = [r for r in M.audit_tail("100", 30) if r.get("event") == "backup"]
+        self.assertTrue(backups)
+        self.assertEqual(backups[0]["backup"], res["backup"])
+
+    def test_exec_backup_failure_blocks_the_command(self):
+        calls, run = self._fake_run(fail_backup=True)
+        with mock.patch.object(M, "run_command", run):
+            res = M.execute("100", "echo x > /root/.ssh/authorized_keys")
+        self.assertTrue(res["blocked"])
+        self.assertEqual(res["reason"], "backup_failed")
+        self.assertEqual(len(calls), 1, "备份失败后不能再执行原命令")
+        failed = [r for r in M.audit_tail("100", 30) if r.get("event") == "backup_failed"]
+        self.assertTrue(failed)
+
+    def test_read_only_sensitive_access_does_not_backup(self):
+        calls, run = self._fake_run()
+        with mock.patch.object(M, "run_command", run):
+            res = M.execute("100", "cp /etc/ssh/sshd_config /tmp/backup")
+        self.assertNotIn("backup", res)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["command"], "cp /etc/ssh/sshd_config /tmp/backup")
+
+    def test_put_backs_up_existing_sensitive_target(self):
+        write_hosts({"100": dict(TransferWiring.CRED)})
+        stub = SftpStub({"/root/.ssh/authorized_keys": bytearray(b"old")})
+        calls, run = self._fake_run()
+        md5 = hashlib.md5(b"hello" * 4).hexdigest()
+        tmp = Path(tempfile.mkdtemp(prefix="backup-put-"))
+        src = tmp / "a.txt"
+        src.write_bytes(b"hello" * 4)
+        with mock.patch.object(M, "_sftp_of", return_value=stub), \
+             mock.patch.object(M, "run_command", run), \
+             mock.patch.object(M, "_remote_md5", return_value=md5):
+            r = M._tool_put_file("100", str(src), "/root/.ssh/authorized_keys", overwrite=True)
+        self.assertTrue(r.get("verified"), str(r))
+        self.assertTrue(r["backup"].startswith("~/.sshmcp-backups/"))
+        self.assertTrue(any("cp -a --" in c["command"] for c in calls), "覆盖前必须先备份旧文件")
+        backups = [x for x in M.audit_tail("100", 40) if x.get("event") == "backup"]
+        self.assertTrue(backups)
+
+    def test_put_backup_failure_does_not_overwrite(self):
+        write_hosts({"100": dict(TransferWiring.CRED)})
+        stub = SftpStub({"/root/.ssh/authorized_keys": bytearray(b"old")})
+        calls, run = self._fake_run(fail_backup=True)
+        tmp = Path(tempfile.mkdtemp(prefix="backup-put-"))
+        src = tmp / "a.txt"
+        src.write_bytes(b"hello" * 4)
+        with mock.patch.object(M, "_sftp_of", return_value=stub), mock.patch.object(M, "run_command", run):
+            r = M._tool_put_file("100", str(src), "/root/.ssh/authorized_keys", overwrite=True)
+        self.assertTrue(r.get("blocked"))
+        self.assertEqual(r.get("reason"), "backup_failed")
+        self.assertEqual(stub.files["/root/.ssh/authorized_keys"], bytearray(b"old"), "原文件不能被覆盖")
+        self.assertEqual(stub.posix, [], "备份失败就不该 rename 到目标")
+
+
+class AuditRisky(unittest.TestCase):
+    def test_only_risky_filters_normal_success(self):
+        host = "risky-only-test"
+        M.audit({"host": host, "event": "executed", "exit_code": 0, "reason": "ok"})
+        M.audit({"host": host, "event": "blocked", "reason": "killlisted", "rule": "deny:x"})
+        M.audit({"host": host, "event": "executed", "exit_code": 1, "reason": "ok"})
+        M.audit({"host": host, "event": "intent", "rule": "forced", "force_reason": "why"})
+        M.audit({"host": host, "event": "backup", "backup": "~/.sshmcp-backups/x"})
+        M.audit({"host": host, "event": "result", "ok": False, "result": {"error": "x"}})
+        data = M._tool_audit_tail(host, 50, only_risky=True)
+        events = [(r.get("event"), r.get("exit_code"), r.get("rule")) for r in data["records"]]
+        self.assertIn(("blocked", None, "deny:x"), events)
+        self.assertIn(("executed", 1, None), events)
+        self.assertIn(("intent", None, "forced"), events)
+        self.assertIn(("backup", None, None), events)
+        self.assertIn(("result", None, None), events)
+        self.assertNotIn(("executed", 0, None), events)
+        self.assertEqual(len(data["records"]), 5)
+        self.assertTrue(data["only_risky"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

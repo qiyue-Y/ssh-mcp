@@ -54,10 +54,12 @@
 
 ### 1.3 比清单更有效的是「可回滚设施」
 
-1. **敏感文件写前自动备份**：`put_file` 覆盖敏感路径、exec 的重定向/tee 命中敏感目标时，先 `cp -a` 到 `~/.sshmcp-backups/<时间戳>/`，备份失败就拒绝执行；返回值带 `backup` 路径并写审计。
+1. **敏感文件写前自动备份**：`put_file` 覆盖敏感路径、exec 的写重定向/`tee`/`rm`/`cp`/`mv`/`install`/`ln`/`sed`/`truncate` 命中敏感目标时，先 `cp -a` 到 `~/.sshmcp-backups/<时间戳>/`，备份失败就拒绝执行；返回值带 `backup` 路径并写审计。
 2. **`force` 带 `force_reason`**：不弹审批、不加往返，只要求越过清单时留一句为什么。审计摘要里能直接看到「谁在什么时候、为什么强制删了 `authorized_keys`」。
-3. **审计只推异常**：`audit_tail(only_risky=true)` 只回 blocked / forced / 失败 / 敏感写。用户很难审计全量日志，就只让这 1% 浮出来。
+3. **审计只推异常**：`audit_tail(only_risky=true)` 只回 blocked / forced / 失败 / 敏感写备份。用户很难审计全量日志，就只让这 1% 浮出来。
 4. 数据删除类的回滚靠主机快照/备份，不靠清单；如果某几台有保护目录，可以在凭据里加 `protected_paths`，命中才要求 `force`。
+
+**2026-11-09 已实现**：`exec` 与 `put_file` 的敏感写前备份、备份失败拒绝执行、`backup` 路径进返回值与审计；`audit_tail(only_risky=true)` 已上线。备份目录不自动清理，留给用户当回滚依据。
 
 ---
 

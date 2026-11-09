@@ -274,39 +274,36 @@ def _rm_slashes_system_dir(tokens: list[str]) -> str | None:
 
 
 # 能就地改写文件的命令：光查重定向/tee 会漏掉 sed -i、cp、mv、rm 这些形态。
-# 值表示检查哪些非选项参数："all" = 全部，"last" = 最后一个（通常是目标文件）。
-_WRITE_OPERAND_COMMANDS = {
-    "rm": "all",
-    "truncate": "all",
-    "mv": "all",
-    "sed": "last",
-    "cp": "last",
-    "install": "last",
-    "ln": "last",
-}
+_WRITE_OPERAND_COMMANDS = frozenset({"rm", "truncate", "mv", "sed", "cp", "install", "ln"})
+
+
+def _sensitive_operands(tokens: list[str]) -> list[str]:
+    """列出命令会就地改写的敏感文件；读形态（无 -i 的 sed、cp 的源）不算。"""
+    found = first_program(tokens)
+    if found is None:
+        return []
+    start, program = found
+    if program not in _WRITE_OPERAND_COMMANDS:
+        return []
+    raw_args = tokens[start + 1 :]
+    args = [tok for tok in raw_args if not tok.startswith("-")]
+    if not args:
+        return []
+    if program == "sed":
+        # 没有 -i / --in-place 的 sed 只读；有的话第一个非选项参数是脚本，其余才是文件
+        if not any(tok.startswith("-i") or tok.startswith("--in-place") for tok in raw_args):
+            return []
+        candidates = args[1:]
+    elif program in ("rm", "truncate", "mv"):
+        candidates = args
+    else:  # cp / install / ln：最后一个非选项参数是目标
+        candidates = args[-1:]
+    return [arg for arg in candidates if any(s in _collapse_path(arg) for s in SENSITIVE_WRITE_TARGETS)]
 
 
 def _sensitive_operand(tokens: list[str]) -> str | None:
-    """命令会就地改写敏感文件时返回那个操作数；否则 None。
-
-    只看非选项参数，不做 shell 展开。`sed` 取最后一个参数，是为了避开脚本里的
-    `s/authorized_keys/x/` 这类误报（真正的目标文件通常在最后）。
-    """
-    found = first_program(tokens)
-    if found is None:
-        return None
-    start, program = found
-    mode = _WRITE_OPERAND_COMMANDS.get(program)
-    if mode is None:
-        return None
-    args = [tok for tok in tokens[start + 1 :] if not tok.startswith("-")]
-    if not args:
-        return None
-    for arg in (args if mode == "all" else args[-1:]):
-        target = _collapse_path(arg)
-        if any(s in target for s in SENSITIVE_WRITE_TARGETS):
-            return arg
-    return None
+    ops = _sensitive_operands(tokens)
+    return ops[0] if ops else None
 
 
 def parse_prefixes(entries: list[str]) -> list[Prefix]:
@@ -347,6 +344,37 @@ def check_write_target(path: str) -> Hit | None:
     if hit is None:
         return None
     return Hit(rule=f"deny:写入敏感文件 {target}", segment=[])
+
+
+def sensitive_write_targets(command: str) -> list[str]:
+    """列出这条命令会写到的敏感文件（原样返回，供写前备份用）。
+
+    与 check() 同一套判定，只是不返回 Hit：调用方要的是「备份哪几个文件」。
+    覆盖写重定向、tee，以及 rm/cp/mv/install/ln/sed/truncate 这类就地改写；
+    解析不了（引号不闭合）就返回空，交由远端 shell 自己失败。
+    """
+    try:
+        tokens = tokenize(split_separators(command))
+    except GuardSyntaxError:
+        return []
+    found: list[str] = []
+
+    def add(target: str) -> None:
+        if target and target not in found and any(s in _collapse_path(target) for s in SENSITIVE_WRITE_TARGETS):
+            found.append(target)
+
+    for seg in split_segments(tokens):
+        for target in redirect_targets(seg):
+            add(target)
+        program = first_program(seg)
+        if program and program[1] == "tee":
+            for arg in seg[program[0] + 1 :]:
+                if not arg.startswith("-"):
+                    add(arg)
+        touched = _sensitive_operands(seg)
+        for target in touched:
+            add(target)
+    return found
 
 
 

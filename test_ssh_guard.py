@@ -148,6 +148,27 @@ class KilllistHits(AssertBlockedMixin, unittest.TestCase):
         )
 
 
+class SensitiveWriteTargets(unittest.TestCase):
+    """写前备份要知道「写哪几个文件」；读形态不能误报。"""
+
+    def test_write_forms_are_listed(self):
+        self.assertEqual(G.sensitive_write_targets("echo x > /etc/sudoers"), ["/etc/sudoers"])
+        self.assertEqual(G.sensitive_write_targets("cp /tmp/x /etc/ssh/sshd_config"), ["/etc/ssh/sshd_config"])
+        self.assertEqual(
+            G.sensitive_write_targets("mv /etc/ssh/sshd_config /root/.ssh/authorized_keys"),
+            ["/etc/ssh/sshd_config", "/root/.ssh/authorized_keys"],
+        )
+        self.assertEqual(
+            G.sensitive_write_targets("sed -i 's/x/y/' /etc/ssh/sshd_config"),
+            ["/etc/ssh/sshd_config"],
+        )
+
+    def test_read_forms_are_not_listed(self):
+        self.assertEqual(G.sensitive_write_targets("cp /etc/ssh/sshd_config /tmp/backup"), [])
+        self.assertEqual(G.sensitive_write_targets("sed -n '/authorized_keys/p' /etc/ssh/sshd_config"), [])
+        self.assertEqual(G.sensitive_write_targets("cat /etc/ssh/sshd_config"), [])
+
+
 class EquivalenceNormalized(AssertBlockedMixin, unittest.TestCase):
     """写法变体必须归一后再比，否则清单形同虚设。"""
 
