@@ -1,22 +1,61 @@
 # ssh-mcp
 
-常驻 SSH 会话的 MCP 服务。替代 `E:\Ilovestudy\env\passkey\ssh-key.ps1` —— 2026-09-28 起用户已规定**所有 SSH 一律走本服务**，那个脚本退为应急与手工使用。
+> 让 AI 通过 SSH 管理远程主机：常驻连接、全文日志、可回滚的 MCP 服务。
 
-已知未修的问题与边界集中在 **`ISSUES.md`**（追加式，供未参与原会话的 Agent 接手）；排查出缺陷时先往那里记一条，再来改代码。
+## 它是什么
 
-可改可不改的**优化建议**记在 **`SUGGESTION.md`**，和 `ISSUES.md` 分开：前者现在不咬人、只是能更好，后者是实测到的缺陷与边界。Agent 发现建议只能先口头提议，**经用户同意才写入**，没点头不改代码。
+一个本地 MCP（Model Context Protocol）服务，把「AI 跑一条远程命令」变成可靠操作：连接复用、输出全文落盘、长任务后台化、文件断点续传、敏感改动可回滚；主机清单有图形界面维护，凭据文件对服务端只读。
 
-## 2026-09-29：权限控制已解除
+- 面向单人或小团队的少量自有主机，不替代 Ansible，也不做多租户平台。
+- 边界是中立的：远端能做什么由那个账号的权限决定；服务端只拦「难以回滚」的手滑。
 
-原来那套「ro 白名单 / rw 黑名单 / 人工 grant」三层判定整条移除。理由（用户判定）：命令过滤挡不住蓄意绕行的 AI，却给每一条正常命令都加了一轮往返和一个假红点 —— 效率代价全额支付，安全收益接近零。
+## 功能一览
 
-服务现在只做三件事：**保持 SSH 连接**、**返回日志**、**注入密码**。
+| 能力 | 说明 |
+|---|---|
+| 12 个工具 | `exec` / `put_file` / `get_file` / `xfer_stat` / `job_*` / `session_reset` / `pin_hostkey` / `list_hosts` / `audit_tail` / `read_output` |
+| 连接与目录 | per-host 连接池 + keepalive；cwd 服务端记忆；`login_shell` / `shell_init` |
+| 提权 | `sudo -S`，口令走 channel stdin（不进 argv、审计、远端 history） |
+| 长任务 | `detach=true` + 远端 job 状态机，服务重启/断连后可续查 |
+| 文件传输 | 分片续传 + 两端 md5；`recursive=true` 传整棵目录，软链跳过 |
+| 输出与审计 | 全文落 `output/`，按行号回捞；`call`/`result` + `call_id`；`only_risky` 只看异常 |
+| 安全与回滚 | 72 条不可逆动作清单；敏感文件写前自动备份；`force_reason` 留痕 |
+| 图形配置 | `hosts_gui.py`：增改删、停用、探测指纹、测试连接、从 known_hosts 导入 |
 
-唯一保留的拦截是一张 72 条的**不可逆动作清单**（`policy.json` 的 `killlist`）：**`username == "root"` 的主机恒查**，非 root 主机要在 `policy.json` 的 `guarded_hosts` 里点名才查。命中后 `exec(force=true)` 一步就过，可用 `force_reason` 留一句为什么。它的定位是「挡手滑的 AI」，不是「挡蓄意的 AI」：毁盘、关机/断电、删数据、把 ssh 关掉、把自己锁在门外这五类形态。
+## 快速开始
 
-`ssh_policy.py`(566 行) → `ssh_guard.py`(~390 行)。删掉的 300 行全是反绕过机制（包装器剥壳、`sh -c` 递归复检、curl/wget 专项、解释器特判）。`grants.json`、CLI `grant`/`revoke`、Windows 原生确认框一并移除。
+```powershell
+uv run --quiet ssh_mcp.py doctor   # 1. 自检配置、凭据、依赖与目录
+uv run hosts_gui.py                # 2. 图形界面配置主机（或手工填 ssh_mcp_hosts.example.json）
+```
 
-## 它解决什么
+```jsonc
+// 3. 接入 MCP 客户端
+"ssh-mcp": {
+  "command": "uv",
+  "args": ["run", "--quiet", "<仓库路径>/ssh_mcp.py"],
+  "env": { "SSHMCP_HOME": "<仓库路径>" }
+}
+```
+
+## 文档地图
+
+| 文件 | 内容 |
+|---|---|
+| `README.md` | 用法、工具、传输、审计与边界（本文件） |
+| `AGENTS.md` | 给 Agent 的固定流程：开 GUI → 等关闭 → 验证配置 |
+| `DESIGN.md` | 下一阶段的设计取舍（安全模型、并发、环境初始化） |
+| `ISSUES.md` | 已知缺陷与实测边界 |
+| `SUGGESTION.md` | 可改可不改的优化建议 |
+| `todo.md` | 任务清单与验收标准 |
+
+## 设计取舍
+
+服务只做三件事：**保持 SSH 连接**、**返回日志**、**注入密码**。命令过滤挡不住蓄意绕行的 AI，却给每条正常命令加一轮往返，所以没有命令白名单、没有审批流。
+
+唯一保留的拦截是一张 72 条的**不可逆动作清单**（`policy.json` 的 `killlist`）：毁盘、关机/断电、删数据、把 ssh 关掉、把自己锁在门外。命中后 `exec(force=true)` 一步就过，理由用 `force_reason` 记进审计。它的定位是「挡手滑」，不是「挡蓄意」；删数据的回滚靠快照或备份，不靠清单。
+
+## 为什么不直接用 ssh / plink
 
 | 之前（plink -batch） | 现在 |
 |---|---|
@@ -30,7 +69,7 @@
 
 ```powershell
 # 自检（配置、凭据、指纹、依赖、审计与日志目录可写）
-uv run --quiet E:\Ilovestudy\MyWork\mcp\ssh-mcp\ssh_mcp.py doctor
+uv run --quiet ssh_mcp.py doctor
 ```
 
 清单判定的离线用例（裸 python 即可，不需要 paramiko；含等价写法与「设计上不再防」的形态）：
@@ -71,7 +110,7 @@ uv run --quiet smoke_stdio.py
 
 ## 配
 
-1. `copy ssh_mcp_hosts.example.json ssh_mcp_hosts.json`，填真实凭据；或者直接用界面维护：`uv run hosts_gui.py`。**这个文件我不读不写**，是红线。
+1. `copy ssh_mcp_hosts.example.json ssh_mcp_hosts.json`，填真实凭据；或者直接用界面维护：`uv run hosts_gui.py`。**凭据文件对服务端只读**：AI 与运行中的服务都不会写它，写只发生在你运行 GUI / `gen_hosts.py --merge` 时。
    可用字段：`address` `port` `username` `auth`（`password`/`key`）`password` `key_path` `hostKey` `purpose`，提权三项 `elevate` `elevate_user` `elevate_password`（见「提权」节），环境初始化字段 `shell_init`（见「环境初始化」节），以及能力位 `disabled` `critical` `xfer`（见下一条）。
    旧字段 `rw_allowed` 已从模型里删掉；凭据文件里残留它会被静默忽略，不用你去清理（有用例钉着这个兼容行为）。
    `auth: "key"` 时 `key_path` 可省略，缺省按 `~/.ssh/{id_ed25519,id_rsa,id_ecdsa,id_dsa}` 顺序找。**带 passphrase 的文件私钥不支持**，此时改为问 ssh-agent 并取它的第一把 key（只取一把：逐把试认证会连着打远端的失败次数）。Windows 的 `ssh-agent` 服务默认是 Stopped/Disabled，要先 `Set-Service ssh-agent -StartupType Manual` 起服务再 `ssh-add`。
@@ -84,17 +123,17 @@ uv run --quiet smoke_stdio.py
    | `critical: true` | 这台**永远查 killlist**，等价于把别名写进 `guarded_hosts`（`list_hosts` 显示 `guard_reason: "critical 标记"`） |
    | `xfer: false` | 只执行、**禁止传文件**：`put_file`/`get_file` 直接拒（`reason: xfer_disabled`）；`xfer_stat` 只读元数据仍可用 |
 
-3. Qoder 里加 MCP（或手工写进 MCP 配置）：
+3. 在 MCP 客户端里加一条服务（以通用 `mcpServers` 写法为例，具体文件位置看你的客户端）：
 
 ```json
 "ssh-mcp": {
   "command": "uv",
-  "args": ["run", "--quiet", "E:\\Ilovestudy\\MyWork\\mcp\\ssh-mcp\\ssh_mcp.py"],
-  "env": { "SSHMCP_HOME": "E:\\Ilovestudy\\MyWork\\mcp\\ssh-mcp" }
+  "args": ["run", "--quiet", "<仓库绝对路径>/ssh_mcp.py"],
+  "env": { "SSHMCP_HOME": "<仓库绝对路径>" }
 }
 ```
 
-加完 `/mcp reload`。
+重启/重载 MCP 客户端后生效（Qoder 里是 `/mcp reload`）。
 
 ## 指纹与 pin_hostkey
 
@@ -330,10 +369,10 @@ SFTP 以登录用户身份写 `/root`、`/etc` 实测都是 `Permission denied`�
 `get_file` 的默认位置按三级解析，改哪级都是热加载：
 
 1. 环境变量 `SSHMCP_XFER`
-2. `policy.json` 的 `defaults.xfer_dir` ← 本机已设为 **`D:\temporaryfile\download`**
-3. 都没有 → 系统真实下载目录（Windows 读注册表 `User Shell Folders` 的 `{374DE290-123F-4565-9164-39C4925E467B}`，因为下载目录可能被重定向到别的盘；本机该值是 `C:\Users\qiyue\Downloads`）
+2. `policy.json` 的 `defaults.xfer_dir`
+3. 都没有 → 系统真实下载目录（Windows 读注册表 `User Shell Folders` 的 `{374DE290-123F-4565-9164-39C4925E467B}`，因为下载目录可能被重定向到别的盘）
 
-预算：`max_transfer_bytes` 4GB、`xfer_chunk_bytes` 1MB、`xfer_timeout_s` 1800。`doctor` 会实测目录可写并对比空闲（`D:` 现余 255.6GB），空闲装不下一个上限文件时会提示。
+预算：`max_transfer_bytes` 4GB、`xfer_chunk_bytes` 1MB、`xfer_timeout_s` 1800。`doctor` 会实测目录可写并对比剩余空间，装不下一个上限文件时会提示。
 
 **远端文件的原文会落到你硬盘**，和 `output/` 一样不脱敏。开发过程中我自己演示过反面教材：提权 `cat /etc/shadow` 之后那行内容整段躺在 `output/*.log` 里，是按 `output_id` 逐个对审计才清干净的。建议判断类需求只读结论（`stat`、`grep -c`），别整读口令/私钥文件。
 
