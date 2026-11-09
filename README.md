@@ -12,9 +12,9 @@
 
 服务现在只做三件事：**保持 SSH 连接**、**返回日志**、**注入密码**。
 
-唯一保留的拦截是一张 25 条的**自杀清单**（`policy.json` 的 `killlist`）：**`username == "root"` 的主机恒查**，非 root 主机要在 `policy.json` 的 `guarded_hosts` 里点名才查。命中后 `exec(force=true)` 一步就过。它的定位是「挡手滑的 AI」，不是「挡蓄意的 AI」：毁盘、把 ssh 关掉、把自己锁在门外这三类形态。
+唯一保留的拦截是一张 72 条的**不可逆动作清单**（`policy.json` 的 `killlist`）：**`username == "root"` 的主机恒查**，非 root 主机要在 `policy.json` 的 `guarded_hosts` 里点名才查。命中后 `exec(force=true)` 一步就过，可用 `force_reason` 留一句为什么。它的定位是「挡手滑的 AI」，不是「挡蓄意的 AI」：毁盘、关机/断电、删数据、把 ssh 关掉、把自己锁在门外这五类形态。
 
-`ssh_policy.py`(566 行) → `ssh_guard.py`(~315 行)。删掉的 300 行全是反绕过机制（包装器剥壳、`sh -c` 递归复检、curl/wget 专项、解释器特判）。`grants.json`、CLI `grant`/`revoke`、Windows 原生确认框一并移除。
+`ssh_policy.py`(566 行) → `ssh_guard.py`(~390 行)。删掉的 300 行全是反绕过机制（包装器剥壳、`sh -c` 递归复检、curl/wget 专项、解释器特判）。`grants.json`、CLI `grant`/`revoke`、Windows 原生确认框一并移除。
 
 ## 它解决什么
 
@@ -69,7 +69,7 @@ uv run --quiet smoke_stdio.py
    可用字段：`address` `port` `username` `auth`（`password`/`key`）`password` `key_path` `hostKey` `purpose`，外加提权三项 `elevate` `elevate_user` `elevate_password`（见「提权」节）。
    旧字段 `rw_allowed` 已从模型里删掉；凭据文件里残留它会被静默忽略，不用你去清理（有用例钉着这个兼容行为）。
    `auth: "key"` 时 `key_path` 可省略，缺省按 `~/.ssh/{id_ed25519,id_rsa,id_ecdsa,id_dsa}` 顺序找。**带 passphrase 的文件私钥不支持**，此时改为问 ssh-agent 并取它的第一把 key（只取一把：逐把试认证会连着打远端的失败次数）。Windows 的 `ssh-agent` 服务默认是 Stopped/Disabled，要先 `Set-Service ssh-agent -StartupType Manual` 起服务再 `ssh-add`。
-2. `policy.json` 现在只剩三样：`defaults`（超时与输出上限）、`killlist`（25 条自杀清单）、`guarded_hosts`（非 root 主机里哪些也要查清单）。
+2. `policy.json` 现在只剩三样：`defaults`（超时与输出上限）、`killlist`（72 条不可逆动作清单）、`guarded_hosts`（非 root 主机里哪些也要查清单）。
 3. Qoder 里加 MCP（或手工写进 MCP 配置）：
 
 ```json
@@ -91,6 +91,11 @@ uv run --quiet smoke_stdio.py
 两条边界：
 - 凭据文件里已钉过 `hostKey` 且与实际不符 → 工具**拒绝覆盖**（返回 `writable: false`），那必须是主机重装或真中间人，由人自己改凭据文件。
 - `hostkeys.json` 只给凭据文件没钉的主机兜底；凭据里钉过就以凭据为准（`list_hosts` 的 `pin_source` 会告诉你是哪边）。
+
+## 批量补齐主机（gen_hosts.py）
+
+`uv run gen_hosts.py` 扫本机 `~/.ssh/known_hosts`（本机 ssh 过的主机）与 `~/.ssh/config`，把凭据文件里还没有的主机（按地址去重）生成到 `ssh_mcp_hosts.candidates.json`：`address` / `port` / `hostKey` 自动填（指纹取 known_hosts 里该机的 ed25519，与 paramiko 首选算法一致），`username` 能从 ssh config 带出的也带上，**`password` 留空给人**。核对后把条目粘进 `ssh_mcp_hosts.json` 即可（`_` 开头的键服务端会忽略）。
+`--merge` 只增不改地并入凭据文件（先自动备份；凭据 JSON 坏了直接拒跑）——**这个命令建议你自己运行**。
 
 ## 提权（elevate）
 
@@ -130,13 +135,15 @@ sudo -S -p '' --user root -- sh -c '<原命令，含 cd 前缀>'
 
 ## 拦截边界（Agent 必读）
 
-`exec(host, command, cwd?, idle_timeout?, max_duration?, force?, elevate?)` 对任何命令一律放行，只在**受保护主机**上查下面这三类形态。受保护 = `username == "root"`，或别名被 `policy.json` 的 `guarded_hosts` 点名（非 root 也挡一手手滑，比如跑共享业务的 `66`），或本次调用带 `elevate=true`（一旦落到 root，破坏面和 root 账号同级，不因登录账号是 `qy` 而免检）。没点名的非 root 主机（当前是 `100`）零拦截。
+`exec(host, command, cwd?, idle_timeout?, max_duration?, force?, elevate?, detach?, force_reason?)` 对任何命令一律放行，只在**受保护主机**上查下面这五类形态。受保护 = `username == "root"`，或别名被 `policy.json` 的 `guarded_hosts` 点名（非 root 也挡一手手滑，比如跑共享业务的 `66`），或本次调用带 `elevate=true`（一旦落到 root，破坏面和 root 账号同级，不因登录账号是 `qy` 而免检）。没点名的非 root 主机（当前是 `100`）零拦截。
 
 | 类别 | 条目 |
 |---|---|
-| 毁盘 | `rm` 递归删一级目录（`/`、`/etc`、`/var`…）、`mkfs*`、`wipefs`、`dd of=/dev/`、`fdisk /dev/`、`parted` |
-| 断电 | `shutdown` `reboot` `halt` `poweroff` `init 0/6` |
-| 锁死自己 | `systemctl stop/disable sshd|ssh`、`systemctl stop firewalld`、`iptables -F/-X`、`nft flush`、`ufw disable`、`userdel` `groupdel` `passwd`、覆写 `authorized_keys`/`sshd_config`/`sudoers`/`fstab`/`shadow`/`passwd` |
+| 毁盘 | `rm` 递归删一级目录（`/`、`/etc`、`/var`…）、`mkfs*`、`wipefs`、`dd of=/dev/`、`fdisk /dev/`、`parted`、`sgdisk` 破坏性子命令、`blkdiscard`、`lvremove`/`vgremove`/`pvremove`、`mdadm --zero-superblock/--create`、`cryptsetup luksFormat/luksErase/erase`、`zpool destroy`/`zfs destroy`、`btrfs subvolume delete` |
+| 断电 | `shutdown` `reboot` `halt` `poweroff` `init 0/6` `telinit 0/6` `systemctl reboot/poweroff/halt/kexec/soft-reboot` |
+| 锁死自己 | `systemctl stop/disable/mask sshd|ssh`、`systemctl stop/disable networking`、`systemctl stop firewalld`、`iptables -F/-X/-P … DROP`、`nft flush`、`ufw disable`、`userdel` `groupdel` `passwd` `chpasswd` `usermod -L`、覆写 `authorized_keys`/`sshd_config`/`sudoers`/`fstab`/`shadow`/`passwd` |
+| 删数据/资源 | `find -delete`、`shred`、`truncate /dev/`、`dropdb`、`mysqladmin drop`、`redis-cli flushall/flushdb`、`docker system prune`、`docker volume prune/rm`、`kubectl delete pvc/namespace/ns`、`virsh undefine --remove-all-storage`、`virsh vol-delete` |
+| 就地改敏感文件 | `rm`/`cp`/`mv`/`install`/`ln`/`sed`/`truncate` 的操作数命中 `authorized_keys`/`sshd_config`/`sudoers`/`fstab`/`shadow`/`passwd` |
 
 判定发生在**发给远端 shell 之前**，所以「看着不像但等价」的写法要自己归一，做三件事：
 
@@ -144,16 +151,16 @@ sudo -S -p '' --user root -- sh -c '<原命令，含 cd 前缀>'
 - **权限位等价**：数字 token 按整数值比，`chmod 0777 /` 等于 `chmod 777 /`。
 - **引号外的 `;` `|` `&` 补空格再切段**：`uptime;rm -rf /` 是两条命令，不分段就只能看见 `uptime`。`2>&1` / `&>` 里的 `&` 不算分隔符。
 
-命中时返回 `{blocked: true, reason: "killlisted", rule, hint}`，hint 就一句「带 force=true 重发」。执行过的 force 命令在审计里记 `rule: "forced"`。
+命中时返回 `{blocked: true, reason: "killlisted", rule, hint}`，hint 会说明带 `force=true` + `force_reason` 重发。执行过的 force 命令在审计里记 `rule: "forced"` 和 `force_reason`（最多 500 字）。
 
-**设计上不再防的形态**（钉在 `test_ssh_guard.py` 的 `DeliberatelyNotCaught` 里，别当成已防住）：`nohup rm -rf /`、`env FOO=1 reboot`、`timeout 5 mkfs /dev/sda`、`bash -c 'rm -rf /'`、`python -c "os.system('reboot')"`、`$(echo rm) -rf /`、`R=/; rm -rf $R`、`vi /etc/ssh/sshd_config`、`sed -i ... /etc/sudoers`。真边界是远端账号权限。
+**设计上不再防的形态**（钉在 `test_ssh_guard.py` 的 `DeliberatelyNotCaught` 里，别当成已防住）：`nohup rm -rf /`、`env FOO=1 reboot`、`timeout 5 mkfs /dev/sda`、`bash -c 'rm -rf /'`、`python -c "os.system('reboot')"`、`$(echo rm) -rf /`、`R=/; rm -rf $R`、`vi /etc/ssh/sshd_config`、`chmod 000 /etc/ssh/sshd_config`、`sudo rm -rf /`。真边界是远端账号权限。
 
 ## 工具
 
 - `list_hosts(brief?)` —— 主机、`pin_source`、是否查清单、限额。`brief=true` 只回短字段（不带每台的 limits 与全量 killlist），省上下文。不含密码。
-- `exec(host, command, cwd?, idle_timeout?, max_duration?, force?, elevate?, detach?)` —— 离散命令。`cwd` 由服务端按主机记忆：单发一条 `cd <目录>`（或光一个 `cd` 回 home）验活成功后写入，后续命令自动从该目录开始；`cd X && cmd` 复合形态只影响本条。被拦下时不建立连接。`elevate=true` 以 root 跑这一条（凭据里得先给这台开 `elevate`）。`detach=true` 丢后台跑并立刻返回 `job_id`（见「后台任务」一节）。
+- `exec(host, command, cwd?, idle_timeout?, max_duration?, force?, elevate?, detach?, force_reason?)` —— 离散命令。`cwd` 由服务端按主机记忆：单发一条 `cd <目录>`（或光一个 `cd` 回 home）验活成功后写入，后续命令自动从该目录开始；`cd X && cmd` 复合形态只影响本条。被拦下时不建立连接。`elevate=true` 以 root 跑这一条（凭据里得先给这台开 `elevate`）。`detach=true` 丢后台跑并立刻返回 `job_id`（见「后台任务」一节）。`force_reason` 是 `force=true` 时写进审计的一句原因。
 - `pin_hostkey(host, trust?)` —— 探测主机指纹；`trust=true` 才写 `hostkeys.json`。
-- `put_file(host, local, remote, overwrite?, force?, elevate?, restart?, mode?)` —— 本机 → 远端，分片续传 + md5。
+- `put_file(host, local, remote, overwrite?, force?, elevate?, restart?, mode?, force_reason?)` —— 本机 → 远端，分片续传 + md5。
 - `get_file(host, remote, local?, overwrite?, elevate?, restart?)` —— 远端 → 本机，落 `defaults.xfer_dir`。
 - `xfer_stat(host, remote)` —— 远端 size/mode/uid/mtime，传前判断该不该传（省一次 `ls -l` 文本解析）。
 - `job_status(host, job_id, offset?, max_bytes?)` —— 读后台任务的状态与输出增量（`offset_next` 供下次只取新增）。

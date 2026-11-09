@@ -48,12 +48,14 @@
 
 匹配方式用多 token 组合（现有规则支持「程序在段首、其余 token 任意位置」），例如 `systemctl` + `reboot|poweroff|halt|kexec`、`dd` + `of=/dev/`，比加一堆单词准。
 
+**2026-11-09 已实现**：清单 25→72 条，覆盖上述五类；`exec`/`put_file` 的 `force_reason` 已写入审计；`rm`/`cp`/`mv`/`install`/`ln`/`sed`/`truncate` 就地改写敏感文件也纳入了检查。
+
 **边界**：清单不可能穷尽，它挡的是「手滑 + 高后果」，不是「蓄意」。`force=true` 仍然一步过，保持效率。
 
 ### 1.3 比清单更有效的是「可回滚设施」
 
 1. **敏感文件写前自动备份**：`put_file` 覆盖敏感路径、exec 的重定向/tee 命中敏感目标时，先 `cp -a` 到 `~/.sshmcp-backups/<时间戳>/`，备份失败就拒绝执行；返回值带 `backup` 路径并写审计。
-2. **`force` 带 `reason`**：不弹审批、不加往返，只要求越过清单时留一句为什么。审计摘要里能直接看到「谁在什么时候、为什么强制删了 `authorized_keys`」。
+2. **`force` 带 `force_reason`**：不弹审批、不加往返，只要求越过清单时留一句为什么。审计摘要里能直接看到「谁在什么时候、为什么强制删了 `authorized_keys`」。
 3. **审计只推异常**：`audit_tail(only_risky=true)` 只回 blocked / forced / 失败 / 敏感写。用户很难审计全量日志，就只让这 1% 浮出来。
 4. 数据删除类的回滚靠主机快照/备份，不靠清单；如果某几台有保护目录，可以在凭据里加 `protected_paths`，命中才要求 `force`。
 

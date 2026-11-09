@@ -49,7 +49,15 @@
 
 ## P0-2 killlist 升级为「不可逆动作清单」
 
-**状态：待办**
+**状态：已完成（2026-11-09）**
+
+**实测证据**
+- `policy.json` 从 25 条扩到 72 条，覆盖电源/启动、磁盘、登录、数据、虚拟化五类。
+- `ssh_guard.py` 新增就地改敏感文件检查：`rm`/`cp`/`mv`/`install`/`ln`/`sed`/`truncate` 的操作数命中 `authorized_keys`/`sshd_config`/`sudoers` 等即拦。
+- `test_ssh_guard.py` 33 例全绿（新增 6 组命中 + 1 组不误杀对照）；`test_connect_refusals.py` 71 例全绿（新增 exec / put_file 的 `force_reason` 审计用例）。
+- 真机 100（临时把 100 当 guarded 主机，只用 `/tmp` 下的临时 `authorized_keys`）：`rm` 被 `deny:敏感文件被就地改写` 拦下、文件仍在；带 `force_reason` 后执行成功、文件删除，审计 intent/executed 两条都带理由。
+- `passwd` 仍保持拦截：无 PTY 时它本来也无法完成，且改口令难回滚；不误杀对照用 `systemctl status/restart`、`docker ps`、`kubectl delete pod` 等。
+- 未覆盖并已写进 README：`chmod 000`、`vi`、`sudo` 包装器这类形态（静态切片看不见）。
 
 **现状**
 - 25 条清单按「程序在段首」匹配；`systemctl reboot/poweroff`、`telinit 0/6` 等不命中。
@@ -59,19 +67,19 @@
 **目标**
 - 覆盖电源/启动、磁盘、登录、数据、虚拟化五类高后果动作。
 - 用多 token 组合匹配（如 `systemctl` + `reboot|poweroff|halt|kexec`），不靠堆单词。
-- `exec` / 传输的 `force` 增加可选 `reason`，审计记录；不增加审批往返。
+- `exec` / 传输的 `force` 增加可选 `force_reason`，审计记录；不增加审批往返。
 
 **范围**
 - `policy.json`：扩展 `killlist`。
 - `ssh_guard.py`：必要的匹配辅助（若现有多 token 前缀规则够用则不改逻辑）。
-- `ssh_mcp.py`：`exec` / `put_file` 的 `force` 旁增加 `reason` 字段并写入审计；MCP schema 增加可选参数。
-- `README.md`：清单边界与 `reason` 用法。
+- `ssh_mcp.py`：`exec` / `put_file` 的 `force` 旁增加 `force_reason` 字段并写入审计；MCP schema 增加可选参数。
+- `README.md`：清单边界与 `force_reason` 用法。
 - `test_ssh_guard.py`：每类至少一条命中 + 一条不误杀。
 
 **验收**
 - `systemctl reboot`、`systemctl poweroff`、`telinit 0`、`dd of=/dev/sda`、`rm -rf /`、写 `authorized_keys`/`sudoers` 均命中。
-- 普通 `systemctl status`、`systemctl restart nginx`、`passwd` 自改（若不拦）不误杀；最终以用例钉住。
-- `force=true, reason="..."` 审计里有 `reason`；不带 reason 仍可执行但审计标注缺失。
+- 普通 `systemctl status`、`systemctl restart nginx`、`docker ps`、`kubectl delete pod` 不误杀；最终以用例钉住。
+- `force=true, force_reason="..."` 审计里有 `force_reason`；不带理由仍可执行，审计里为 null。
 
 **风险 / 回退**
 - 风险：清单扩大可能误杀正常运维命令；每条新增都要有「不误杀」用例。

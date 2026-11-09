@@ -971,7 +971,12 @@ def _preflight(alias: str, command: str) -> tuple[dict | None, HostCred | None, 
     return (None, cred, pin)
 
 
-def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None, force: bool = False, elevate: bool = False, detach: bool = False) -> dict:
+def _force_reason(reason: str) -> str | None:
+    """force 的理由只留一小段：审计要能读，不让人把整篇日志塞进来。"""
+    return (reason or "").strip()[:500] or None
+
+
+def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None, force: bool = False, elevate: bool = False, detach: bool = False, force_reason: str = "") -> dict:
     refusal, cred, pin = _preflight(alias, command)
     if refusal is not None:
         return refusal
@@ -994,12 +999,17 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
     guarded = G.applies(cred.privileged, alias, guard) or elevate
     hit = None if cd_target is not None or not guarded else G.check(command, guard)
     if hit is not None and not force:
-        return _block(alias, command, "killlisted", hit.rule, "确需执行请带 force=true 重发同一条命令")
+        return _block(alias, command, "killlisted", hit.rule,
+                      "确需执行请带 force=true 重发同一条命令，并用 force_reason 写一句为什么")
     rule = "cd_only" if cd_target is not None else ("forced" if hit else "pass")
 
     # fail closed：审计写不进去就不执行
+    intent = {"host": alias, "command": command, "event": "intent", "rule": rule, "guarded": guarded,
+              "elevated": elevate or None, "detach": detach or None}
+    if force:
+        intent["force_reason"] = _force_reason(force_reason)
     try:
-        audit({"host": alias, "command": command, "event": "intent", "rule": rule, "guarded": guarded, "elevated": elevate or None, "detach": detach or None})
+        audit(intent)
     except OSError as exc:
         return _block(alias, command, "audit_write_failed", "audit_unwritable", f"审计目录不可写：{exc}")
 
@@ -1032,22 +1042,26 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
         end_cwd = start_cwd
 
     _remember_output_host(res.output_id, alias)
-    audit(
-        {
-            "host": alias,
-            "command": command,
-            "event": "executed",
-            "reason": res.timed_out or "ok",
-            "rule": rule,
-            "elevated": elevate or None,
-            "ran_as": (cred.elevate_user or "root") if elevate else None,
-            "exit_code": res.exit_code,
-            "output_id": res.output_id,
-            "output": res.stats,
-            **({"stderr_head": res.stderr[:300]} if res.stderr and (res.timed_out or res.exit_code != 0) else {}),
-        }
-    )
-    return _ok(alias, command, res, start_cwd, end_cwd, hit.rule if hit else None, elevate, cred.elevate_user or "root")
+    executed = {
+        "host": alias,
+        "command": command,
+        "event": "executed",
+        "reason": res.timed_out or "ok",
+        "rule": rule,
+        "elevated": elevate or None,
+        "ran_as": (cred.elevate_user or "root") if elevate else None,
+        "exit_code": res.exit_code,
+        "output_id": res.output_id,
+        "output": res.stats,
+        **({"stderr_head": res.stderr[:300]} if res.stderr and (res.timed_out or res.exit_code != 0) else {}),
+    }
+    if force:
+        executed["force_reason"] = _force_reason(force_reason)
+    audit(executed)
+    out = _ok(alias, command, res, start_cwd, end_cwd, hit.rule if hit else None, elevate, cred.elevate_user or "root")
+    if force:
+        out["force_reason"] = _force_reason(force_reason)
+    return out
 
 
 ECHO_LIMIT = 200  # 回显给调用方的命令原文上限；全文始终在审计里，回显只是给对照用
@@ -1160,8 +1174,8 @@ def _tool_list_hosts(brief: bool = False) -> dict:
     }
 
 
-def _tool_exec(host: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None, force: bool = False, elevate: bool = False, detach: bool = False) -> dict:
-    return execute(host, command, cwd, idle_timeout, max_duration, force, elevate, detach)
+def _tool_exec(host: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None, force: bool = False, elevate: bool = False, detach: bool = False, force_reason: str = "") -> dict:
+    return execute(host, command, cwd, idle_timeout, max_duration, force, elevate, detach, force_reason)
 
 
 def _tool_pin_hostkey(host: str, trust: bool = False) -> dict:
@@ -1223,11 +1237,12 @@ def _transfer_guard(cred: HostCred, alias: str, remote: str, elevate: bool, forc
     hit = G.check_write_target(remote)
     if hit is None or force:
         return None
-    return _block(alias, f"<put> {remote}", "killlisted", hit.rule, "确需写入请带 force=true 重发")
+    return _block(alias, f"<put> {remote}", "killlisted", hit.rule,
+                  "确需写入请带 force=true 重发，并用 force_reason 写一句为什么")
 
 
 def _tool_put_file(host: str, local: str, remote: str, overwrite: bool = False, force: bool = False,
-                   elevate: bool = False, restart: bool = False, mode: str = "") -> dict:
+                   elevate: bool = False, restart: bool = False, mode: str = "", force_reason: str = "") -> dict:
     guard = GUARD.get()
     refusal, cred, pin = _preflight(host, f"<put> {local} -> {remote}")
     if refusal is not None:
@@ -1247,12 +1262,17 @@ def _tool_put_file(host: str, local: str, remote: str, overwrite: bool = False, 
                       f"{size} 字节 > 上限 {guard.max_transfer_bytes}（policy.json 的 defaults.max_transfer_bytes）")
 
     try:
-        audit({"host": host, "command": f"<put> {src} -> {remote}", "event": "intent",
-               "rule": "forced" if force else "pass", "elevated": elevate or None, "bytes": size})
+        intent = {"host": host, "command": f"<put> {src} -> {remote}", "event": "intent",
+                  "rule": "forced" if force else "pass", "elevated": elevate or None, "bytes": size}
+        if force:
+            intent["force_reason"] = _force_reason(force_reason)
+        audit(intent)
     except OSError as exc:
         return _block(host, f"<put> {remote}", "audit_write_failed", "audit_unwritable", f"审计目录不可写：{exc}")
 
     out: dict = {"host": host, "direction": "put", "local": str(src), "remote": remote, "bytes": size}
+    if force:
+        out["force_reason"] = _force_reason(force_reason)
     # 同目标串行：两个调用写同一个远端路径会复用同一个 part，续传点会互相踩。
     POOL.begin(host)
     xfer_lock = POOL.xfer_lock(f"put:{host}:{remote}")
@@ -1310,9 +1330,12 @@ def _tool_put_file(host: str, local: str, remote: str, overwrite: bool = False, 
             _remote_rename(sftp, part, remote, overwrite)
         out["verified"] = True
         out["final"] = remote
-        audit({"host": host, "command": f"<put> {src} -> {remote}", "event": "transferred", "bytes": size,
-               "md5": local_md5, "resumed_from": tr.resumed_from, "seconds": out["seconds"],
-               "elevated": elevate or None})
+        transferred = {"host": host, "command": f"<put> {src} -> {remote}", "event": "transferred",
+                       "bytes": size, "md5": local_md5, "resumed_from": tr.resumed_from,
+                       "seconds": out["seconds"], "elevated": elevate or None}
+        if force:
+            transferred["force_reason"] = _force_reason(force_reason)
+        audit(transferred)
     except X.TransferAborted as exc:
         out.update({"verified": False, "aborted": str(exc), "hint": "part 已保留，重调同一参数即从缺口续传"})
     except Exception as exc:  # noqa: BLE001 - SFTP/OSError 形态太杂，原样回给调用方
@@ -1718,7 +1741,8 @@ def build_server():
         description=(
             "在远端执行一条离散命令（不开交互 shell）。服务端不做权限控制，命令原样交给远端 shell；"
             "只有受保护主机（username=root，或被 policy.json 的 guarded_hosts 点名，或本次带 elevate）"
-            "会查一张自杀清单，命中时带 force=true 即可放行。被拦下时不建立连接。"
+            "会查一张自杀清单，命中时带 force=true 即可放行（建议同时用 force_reason 写一句为什么，进审计）。"
+            "被拦下时不建立连接。"
             "cwd 由服务端按主机记忆，可用参数覆盖；max_duration 传多大就用多大。"
             "elevate=true 以 root 跑这一条（凭据里该主机须 elevate:true）——服务端用 sudo -S 并把口令写进"
             "channel stdin，口令不进命令行、不进审计、不进远端 history；提权命令一律查清单。"
@@ -1736,11 +1760,12 @@ def build_server():
         force: bool = False,
         elevate: bool = False,
         detach: bool = False,
+        force_reason: str = "",
     ) -> dict:
         import anyio
 
         return await anyio.to_thread.run_sync(
-            lambda: _tool_exec(host, command, cwd, idle_timeout, max_duration, force, elevate, detach)
+            lambda: _tool_exec(host, command, cwd, idle_timeout, max_duration, force, elevate, detach, force_reason)
         )
 
     @server.tool(
@@ -1762,7 +1787,8 @@ def build_server():
         name="put_file",
         description=(
             "本机 -> 远端，分片断点续传 + 整文件 md5 校验。中断后再调同一参数会从缺口那片继续，不重头传。"
-            "写入目标受 exec 那张清单约束（authorized_keys/sshd_config/sudoers 之类会被拦），force=true 可越过。"
+            "写入目标受 exec 那张清单约束（authorized_keys/sshd_config/sudoers 之类会被拦），force=true 可越过"
+            "（建议同时用 force_reason 写一句为什么，进审计）。"
             "远端已存在同名文件时默认拒绝，要覆盖带 overwrite=true。"
             "elevate=true 走两段式：先落到远端 ~/.sshmcp-xfer/ 再 sudo install 到目标（/root、/etc 只有这样才能写）。"
             "上限取 policy.json 的 defaults.max_transfer_bytes（现 4GB）。"
@@ -1778,11 +1804,12 @@ def build_server():
         elevate: bool = False,
         restart: bool = False,
         mode: str = "",
+        force_reason: str = "",
     ) -> dict:
         import anyio
 
         return await anyio.to_thread.run_sync(
-            lambda: _tool_put_file(host, local, remote, overwrite, force, elevate, restart, mode)
+            lambda: _tool_put_file(host, local, remote, overwrite, force, elevate, restart, mode, force_reason)
         )
 
     @server.tool(

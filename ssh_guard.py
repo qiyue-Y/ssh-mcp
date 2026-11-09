@@ -273,6 +273,42 @@ def _rm_slashes_system_dir(tokens: list[str]) -> str | None:
     return None
 
 
+# 能就地改写文件的命令：光查重定向/tee 会漏掉 sed -i、cp、mv、rm 这些形态。
+# 值表示检查哪些非选项参数："all" = 全部，"last" = 最后一个（通常是目标文件）。
+_WRITE_OPERAND_COMMANDS = {
+    "rm": "all",
+    "truncate": "all",
+    "mv": "all",
+    "sed": "last",
+    "cp": "last",
+    "install": "last",
+    "ln": "last",
+}
+
+
+def _sensitive_operand(tokens: list[str]) -> str | None:
+    """命令会就地改写敏感文件时返回那个操作数；否则 None。
+
+    只看非选项参数，不做 shell 展开。`sed` 取最后一个参数，是为了避开脚本里的
+    `s/authorized_keys/x/` 这类误报（真正的目标文件通常在最后）。
+    """
+    found = first_program(tokens)
+    if found is None:
+        return None
+    start, program = found
+    mode = _WRITE_OPERAND_COMMANDS.get(program)
+    if mode is None:
+        return None
+    args = [tok for tok in tokens[start + 1 :] if not tok.startswith("-")]
+    if not args:
+        return None
+    for arg in (args if mode == "all" else args[-1:]):
+        target = _collapse_path(arg)
+        if any(s in target for s in SENSITIVE_WRITE_TARGETS):
+            return arg
+    return None
+
+
 def parse_prefixes(entries: list[str]) -> list[Prefix]:
     out: list[Prefix] = []
     for raw in entries:
@@ -347,4 +383,7 @@ def _check_segment(seg: list[str], config: GuardConfig) -> Hit | None:
         for arg in seg[found[0] + 1 :]:
             if not arg.startswith("-") and any(s in arg for s in SENSITIVE_WRITE_TARGETS):
                 return Hit(rule=f"deny:tee 写入敏感文件 {arg}", segment=seg)
+    touched = _sensitive_operand(seg)
+    if touched:
+        return Hit(rule=f"deny:敏感文件被就地改写 {touched}", segment=seg)
     return None

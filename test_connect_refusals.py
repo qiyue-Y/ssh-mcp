@@ -540,6 +540,15 @@ class KilllistWiring(unittest.TestCase):
         forced = [r for r in M.audit_tail(None, 40) if r.get("rule") == "forced"]
         self.assertTrue(forced, "审计里要能看出这条是 force 越过了清单")
 
+    def test_force_reason_is_recorded(self):
+        write_hosts({"admin": dict(ROOT_PINNED)})
+        reason = "手工重建测试盘"
+        with mock.patch.object(M, "run_command", fake_run(0)):
+            res = M.execute("admin", "mkfs.ext4 /dev/sda1", force=True, force_reason=reason)
+        self.assertEqual(res["force_reason"], reason)
+        records = [r for r in M.audit_tail(None, 40) if r.get("force_reason") == reason]
+        self.assertGreaterEqual(len(records), 2, "intent 与 executed 都该带理由")
+
     def test_benign_command_on_root_host_is_untouched(self):
         write_hosts({"admin": dict(ROOT_PINNED)})
         with mock.patch.object(M, "run_command", fake_run(0)):
@@ -869,6 +878,17 @@ class TransferWiring(unittest.TestCase):
         self.assertEqual(r["reason"], "killlisted")
         self.assertIn("authorized_keys", r["rule"])
         self.assertEqual(opened, [], "被拦就不该建 SFTP 通道")
+
+    def test_force_reason_is_recorded_on_transfer(self):
+        write_hosts({"guarded-user": dict(self.CRED)})
+        reason = "迁移公钥"
+        with mock.patch.object(M, "_sftp_of", side_effect=RuntimeError("stop here")):
+            r = M._tool_put_file("guarded-user", str(self.src), "/root/.ssh/authorized_keys",
+                                 force=True, force_reason=reason)
+        self.assertEqual(r["force_reason"], reason)
+        records = [x for x in M.audit_tail(None, 60)
+                   if x.get("event") == "intent" and x.get("force_reason") == reason]
+        self.assertTrue(records, "传输的强制理由要进审计")
 
     def test_unguarded_host_is_not_target_checked(self):
         """没点名的非 root 主机不查目标 —— 与 exec 的语义一致，不能只给传输加严。"""

@@ -74,6 +74,79 @@ class KilllistHits(AssertBlockedMixin, unittest.TestCase):
             "tee /etc/fstab",
         )
 
+    def test_systemd_power_and_telinit(self):
+        self.assertBlocked(
+            "systemctl reboot",
+            "systemctl poweroff",
+            "systemctl halt",
+            "systemctl kexec",
+            "systemctl soft-reboot",
+            "telinit 0",
+            "telinit 6",
+        )
+
+    def test_disk_beyond_mkfs(self):
+        self.assertBlocked(
+            "sgdisk --zap-all /dev/sda",
+            "sgdisk -Z /dev/sda",
+            "sgdisk --clear /dev/sda",
+            "sgdisk -o /dev/sda",
+            "blkdiscard /dev/sda",
+            "lvremove -f vg/lv",
+            "vgremove vg",
+            "pvremove /dev/sdb",
+            "mdadm --zero-superblock /dev/sdb1",
+            "mdadm --create /dev/md0 --level=1 /dev/sdb1 /dev/sdc1",
+            "cryptsetup luksFormat /dev/sdb",
+            "cryptsetup luksErase /dev/sdb",
+            "cryptsetup erase /dev/sdb",
+            "zpool destroy tank",
+            "zfs destroy tank/data",
+            "btrfs subvolume delete /mnt/@data",
+        )
+
+    def test_login_and_network_lockout(self):
+        self.assertBlocked(
+            "systemctl mask sshd",
+            "systemctl mask ssh",
+            "systemctl stop networking",
+            "systemctl disable networking",
+            "iptables -P INPUT DROP",
+            "iptables -P OUTPUT DROP",
+            "iptables -P FORWARD DROP",
+            "chpasswd",
+            "usermod -L qy",
+        )
+
+    def test_data_and_virtualization(self):
+        self.assertBlocked(
+            "find /tmp -name x -delete",
+            "shred -u /tmp/x",
+            "truncate -s 0 /dev/sda",
+            "dropdb mydb",
+            "mysqladmin drop mydb",
+            "redis-cli flushall",
+            "redis-cli flushdb",
+            "docker system prune -af",
+            "docker volume prune -f",
+            "docker volume rm data",
+            "kubectl delete pvc data",
+            "kubectl delete namespace prod",
+            "kubectl delete ns prod",
+            "virsh undefine vm --remove-all-storage",
+            "virsh vol-delete vol",
+        )
+
+    def test_sensitive_file_in_place_writes(self):
+        self.assertBlocked(
+            "cp /tmp/x /etc/ssh/sshd_config",
+            "mv /etc/ssh/sshd_config /tmp/",
+            "sed -i 's/^#Port 22/Port 2222/' /etc/ssh/sshd_config",
+            "rm /etc/ssh/sshd_config",
+            "ln -sf /tmp/x /root/.ssh/authorized_keys",
+            "truncate -s 0 /etc/ssh/sshd_config",
+        )
+
 
 class EquivalenceNormalized(AssertBlockedMixin, unittest.TestCase):
     """写法变体必须归一后再比，否则清单形同虚设。"""
@@ -127,13 +200,34 @@ class BenignCommandsPass(AssertBlockedMixin, unittest.TestCase):
         self.assertPasses(
             "apt install -y nginx",
             "pip install torch",
-            "docker system prune -af",
+            "docker ps",
+            "docker system df",
             "kubectl delete pod x",
             "useradd bob",
             "mount /dev/sdb1 /mnt/data",
             "crontab -r",
             "history -c",
             "sudo systemctl restart sshd",
+        )
+
+    def test_extended_benign_admin_work(self):
+        """新增五类不能把正常运维误杀：读查看、普通重启、备份、非敏感路径写都放行。"""
+        self.assertPasses(
+            "systemctl status sshd",
+            "systemctl restart nginx",
+            "zpool status",
+            "zfs list",
+            "virsh list",
+            "redis-cli ping",
+            "mysqladmin status",
+            "find /tmp -name '*.log'",
+            "truncate -s 0 /tmp/app.log",
+            "cp /etc/ssh/sshd_config /tmp/backup",
+            "mv /tmp/a /tmp/b",
+            "sed -n '/authorized_keys/p' /tmp/log",
+            "ln -s /tmp/a /tmp/b",
+            "rm /tmp/x",
+            "install -m 600 /tmp/x /tmp/y",
         )
 
 
