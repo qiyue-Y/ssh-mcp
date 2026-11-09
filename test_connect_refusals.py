@@ -285,7 +285,7 @@ CALLS: list[tuple] = []
 
 
 def fake_run(output_lines: int = 0):
-    def _run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False):
+    def _run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False, login_shell=False, shell_init=False):
         CALLS.append((cred.alias, pin, command, cwd, idle_s, max_s))
         for n in range(1, output_lines + 1):
             spill.write("out", f"row {n:05d} compiling\n".encode())
@@ -356,7 +356,7 @@ class ExecWiring(unittest.TestCase):
         write_hosts({"100": dict(PINNED)})
         seen = {}
 
-        def spy(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False):
+        def spy(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False, login_shell=False, shell_init=False):
             seen["max_s"] = max_s
             seen["idle_s"] = idle_s
             spill.close()
@@ -560,7 +560,7 @@ class KilllistWiring(unittest.TestCase):
         """单独的 cd 只改服务端记的 cwd，不触碰远端状态，root 主机也不必 force。"""
         write_hosts({"admin": dict(ROOT_PINNED)})
 
-        def pwd_run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False):
+        def pwd_run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False, login_shell=False, shell_init=False):
             spill.write("out", b"/tmp\n")
             spill.close()
             return M.RunResult(exit_code=0, stdout=spill.inline("out"), stderr="", truncated=False, timed_out=None, output_id=spill.run_id, stats=spill.stats())
@@ -584,7 +584,7 @@ class KilllistWiring(unittest.TestCase):
         write_hosts({"admin": dict(ROOT_PINNED)})
         seen: list[str] = []
 
-        def pwd_run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False):
+        def pwd_run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False, login_shell=False, shell_init=False):
             seen.append(command)
             spill.write("out", b"/home/qy\n")
             spill.close()
@@ -639,7 +639,7 @@ class DetachWiring(unittest.TestCase):
 
     @staticmethod
     def _run_with(out: bytes):
-        def _run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False):
+        def _run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False, login_shell=False, shell_init=False):
             spill.write("out", out)
             spill.close()
             return M.RunResult(exit_code=0, stdout=out.decode(), stderr="", truncated=False,
@@ -663,7 +663,7 @@ class DetachWiring(unittest.TestCase):
         write_hosts({"admin": dict(ROOT_PINNED)})
         seen = []
 
-        def _run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False):
+        def _run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False, login_shell=False, shell_init=False):
             seen.append(command)
             spill.write("out", b"STARTED 4242\n")
             spill.close()
@@ -963,7 +963,7 @@ class TransferWiring(unittest.TestCase):
 
         seen = []
 
-        def ok_run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False):
+        def ok_run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False, login_shell=False, shell_init=False):
             seen.append((command, elevate))
             spill.close()
             return M.RunResult(exit_code=0, stdout="", stderr="", truncated=False, timed_out=None,
@@ -1162,7 +1162,7 @@ class BackupWiring(unittest.TestCase):
     def _fake_run(fail_backup: bool = False):
         calls = []
 
-        def run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False):
+        def run(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False, login_shell=False, shell_init=False):
             calls.append({"command": command, "cwd": cwd, "elevate": elevate})
             spill.close()
             if fail_backup and "sshmcp-backups" in command:
@@ -1257,6 +1257,71 @@ class AuditRisky(unittest.TestCase):
         self.assertNotIn(("executed", 0, None), events)
         self.assertEqual(len(data["records"]), 5)
         self.assertTrue(data["only_risky"])
+
+
+class ShellInit(unittest.TestCase):
+    """login_shell / shell_init 只拼命令串，不改变既有形态。"""
+
+    CRED = M.HostCred(alias="h", address="127.0.0.1", username="u", password="p")
+
+    def test_default_shape_is_unchanged(self):
+        self.assertEqual(M._assemble_remote("id", "~", self.CRED), "id")
+        self.assertEqual(M._assemble_remote("id", "/tmp", self.CRED), "cd /tmp && id")
+
+    def test_login_shell_wraps_with_bash_lc(self):
+        self.assertEqual(M._assemble_remote("id", "~", self.CRED, login_shell=True), "bash -lc id")
+        self.assertEqual(
+            M._assemble_remote("id", "/tmp", self.CRED, login_shell=True),
+            "bash -lc 'cd /tmp && id'",
+        )
+
+    def test_shell_init_runs_first_and_fails_loudly(self):
+        cred = M.HostCred(alias="h", address="a", username="u", password="p", shell_init="~/miniconda3/etc/profile.d/conda.sh")
+        body = M._assemble_remote("python -V", "~", cred, shell_init=True)
+        self.assertIn(". ~/miniconda3/etc/profile.d/conda.sh", body)
+        self.assertIn("exit 97", body)
+        self.assertTrue(body.endswith("python -V"))
+        self.assertEqual(M._assemble_remote("python -V", "~", cred, shell_init=False), "python -V", "不传开关就不 source")
+
+    def test_shell_init_goes_after_cd(self):
+        cred = M.HostCred(alias="h", address="a", username="u", password="p", shell_init="/opt/env.sh")
+        body = M._assemble_remote("make", "/srv/app", cred, shell_init=True)
+        self.assertTrue(body.startswith("cd /srv/app && "), body)
+        self.assertLess(body.index("/opt/env.sh"), body.index("make"))
+
+    def test_exec_passes_login_shell_to_run_command(self):
+        write_hosts({"100": dict(PINNED)})
+        seen = {}
+
+        def spy(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False, login_shell=False, shell_init=False):
+            seen["command"] = command
+            seen["login_shell"] = login_shell
+            seen["shell_init"] = shell_init
+            spill.close()
+            return M.RunResult(exit_code=0, stdout="", stderr="", truncated=False, timed_out=None,
+                               output_id=spill.run_id, stats=spill.stats())
+
+        with mock.patch.object(M, "run_command", spy):
+            M.execute("100", "python -V", login_shell=True)
+        self.assertTrue(seen["login_shell"])
+        self.assertTrue(seen["shell_init"], "exec 路径要启用凭据里的 shell_init")
+        self.assertEqual(seen["command"], "python -V", "包装在 run_command 里做，别改调用方看到的命令")
+
+    def test_internal_commands_keep_init_off(self):
+        """备份、md5、job 脚本这类内部命令不 source，避免初始化片段的输出污染判断。"""
+        calls = []
+
+        def spy(cred, pin, command, cwd, idle_s, max_s, spill, elevate=False, login_shell=False, shell_init=False):
+            calls.append(shell_init)
+            spill.close()
+            return M.RunResult(exit_code=0, stdout="", stderr="", truncated=False, timed_out=None,
+                               output_id=spill.run_id, stats=spill.stats())
+
+        write_hosts({"100": dict(PINNED)})
+        with mock.patch.object(M, "run_command", spy):
+            M.execute("100", "rm /root/.ssh/authorized_keys")  # 触发写前备份
+        self.assertEqual(len(calls), 2, "备份一次 + 原命令一次")
+        self.assertFalse(calls[0], "备份命令不该 source shell_init")
 
 
 if __name__ == "__main__":

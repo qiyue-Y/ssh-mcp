@@ -100,7 +100,7 @@ def main() -> int:
                 failures.append(f"缺工具 {expect}")
         # 解除权限控制后仍要在 schema 里：越清单的开关、探测指纹的确认位、续传与覆盖开关
         schemas = {t["name"]: t.get("inputSchema", {}).get("properties", {}) for t in tools}
-        for p in ("force", "elevate", "detach", "force_reason"):
+        for p in ("force", "elevate", "detach", "force_reason", "login_shell"):
             if p not in schemas.get("exec", {}):
                 failures.append(f"exec 缺 {p} 参数")
         for p in ("offset", "max_bytes"):

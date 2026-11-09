@@ -123,7 +123,15 @@
 
 ## P1-2 `login_shell` / `shell_init`
 
-**状态：待办**
+**状态：已完成（2026-11-09）**
+
+**实测证据**
+- `exec(login_shell=true)` → 实际下发 `bash -lc '<cd 前缀 + 命令>'`；默认为空时不改变任何既有命令串。
+- 凭据字段 `shell_init`（也接受 `shellInit`）：顺序为 `cd <cwd> && { . <init>; } || { echo '[sshmcp] shell_init 失败' >&2; exit 97; }; <命令>`；失败返回 97，不与用户命令退出码混淆。
+- `shell_init` 只在用户命令前生效，备份 / md5 / job 脚本等内部命令不 source。
+- detach 路径同样支持：`bash -lc` 与 shell_init 在交给远端 job wrapper 之前就拼好；审计与回显仍记用户原话。
+- 离线：`test_connect_refusals.py` 83 例全绿（新增 5 条 bootstrapping 用例），`smoke_stdio` 断言 `exec` schema 含 `login_shell`。
+- 真机 100（`/tmp` 下临时 env.sh，验完清理）：不配 `shell_init` 时 `echo $SSHMCP_PROBE` 得 `empty`，配上后得 `hello`；指向不存在的片段时 `exit_code=97`、stderr 同时有 bash 的缺文件报错与 `[sshmcp] shell_init 失败`、stdout 为空（命令没执行）；`login_shell=true` 下 `echo $0` 得 `bash`。
 
 **现状**
 - 每条命令独立执行，conda/venv/export 需要调用方自己拼 `source ... && ...`。

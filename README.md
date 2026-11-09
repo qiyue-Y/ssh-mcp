@@ -66,7 +66,7 @@ uv run --quiet smoke_stdio.py
 ## 配
 
 1. `copy ssh_mcp_hosts.example.json ssh_mcp_hosts.json`，填真实凭据。**这个文件我不读不写**，是红线。
-   可用字段：`address` `port` `username` `auth`（`password`/`key`）`password` `key_path` `hostKey` `purpose`，外加提权三项 `elevate` `elevate_user` `elevate_password`（见「提权」节）。
+   可用字段：`address` `port` `username` `auth`（`password`/`key`）`password` `key_path` `hostKey` `purpose`，外加提权三项 `elevate` `elevate_user` `elevate_password`（见「提权」节），以及环境初始化字段 `shell_init`（见「环境初始化」节）。
    旧字段 `rw_allowed` 已从模型里删掉；凭据文件里残留它会被静默忽略，不用你去清理（有用例钉着这个兼容行为）。
    `auth: "key"` 时 `key_path` 可省略，缺省按 `~/.ssh/{id_ed25519,id_rsa,id_ecdsa,id_dsa}` 顺序找。**带 passphrase 的文件私钥不支持**，此时改为问 ssh-agent 并取它的第一把 key（只取一把：逐把试认证会连着打远端的失败次数）。Windows 的 `ssh-agent` 服务默认是 Stopped/Disabled，要先 `Set-Service ssh-agent -StartupType Manual` 起服务再 `ssh-add`。
 2. `policy.json` 现在只剩三样：`defaults`（超时与输出上限）、`killlist`（72 条不可逆动作清单）、`guarded_hosts`（非 root 主机里哪些也要查清单）。
@@ -158,7 +158,7 @@ sudo -S -p '' --user root -- sh -c '<原命令，含 cd 前缀>'
 ## 工具
 
 - `list_hosts(brief?)` —— 主机、`pin_source`、是否查清单、限额。`brief=true` 只回短字段（不带每台的 limits 与全量 killlist），省上下文。不含密码。
-- `exec(host, command, cwd?, idle_timeout?, max_duration?, force?, elevate?, detach?, force_reason?)` —— 离散命令。`cwd` 由服务端按主机记忆：单发一条 `cd <目录>`（或光一个 `cd` 回 home）验活成功后写入，后续命令自动从该目录开始；`cd X && cmd` 复合形态只影响本条。被拦下时不建立连接。`elevate=true` 以 root 跑这一条（凭据里得先给这台开 `elevate`）。`detach=true` 丢后台跑并立刻返回 `job_id`（见「后台任务」一节）。`force_reason` 是 `force=true` 时写进审计的一句原因。
+- `exec(host, command, cwd?, idle_timeout?, max_duration?, force?, elevate?, detach?, force_reason?, login_shell?)` —— 离散命令。`cwd` 由服务端按主机记忆：单发一条 `cd <目录>`（或光一个 `cd` 回 home）验活成功后写入，后续命令自动从该目录开始；`cd X && cmd` 复合形态只影响本条。被拦下时不建立连接。`elevate=true` 以 root 跑这一条（凭据里得先给这台开 `elevate`）。`detach=true` 丢后台跑并立刻返回 `job_id`（见「后台任务」一节）。`force_reason` 是 `force=true` 时写进审计的一句原因。`login_shell=true` 用 `bash -lc` 跑这一条（见「环境初始化」）。
 - `pin_hostkey(host, trust?)` —— 探测主机指纹；`trust=true` 才写 `hostkeys.json`。
 - `put_file(host, local, remote, overwrite?, force?, elevate?, restart?, mode?, force_reason?)` —— 本机 → 远端，分片续传 + md5。
 - `get_file(host, remote, local?, overwrite?, elevate?, restart?)` —— 远端 → 本机，落 `defaults.xfer_dir`。
@@ -182,6 +182,31 @@ sudo -S -p '' --user root -- sh -c '<原命令，含 cd 前缀>'
 - **备份失败就不执行**：返回 `{blocked:true, reason:"backup_failed"}`，原文件保持不动。目标文件本来不存在不算失败（没有旧内容可备）。
 - 返回值带 `backup` 路径，审计记 `event:"backup"`（成功）或 `backup_failed`（失败），可用来恢复：`cp -a ~/.sshmcp-backups/<目录>/00-authorized_keys /root/.ssh/authorized_keys`。
 - 备份目录不会自动清理（它不是调试垃圾，而是回滚依据）；空间不够时自己删旧目录。
+
+## 环境初始化（login_shell / shell_init）
+
+本服务**不开持久 shell**（原因见 `DESIGN.md`：隐藏状态不可重放、特权状态会隐身、回滚只能杀会话）。需要"先激活环境再跑命令"时，用这两个显式开关，不要把 MCP 做成半个终端：
+
+| 形态 | 用法 | 适用 |
+|---|---|---|
+| 登录 shell | `exec(host, "python -V", login_shell=true)` | 需要 profile 里的 PATH / 环境变量；会在命令外包一层 `bash -lc` |
+| 固定初始化片段 | 凭据里写 `"shell_init": "~/miniconda3/etc/profile.d/conda.sh"` | conda / venv / 自定义 PATH，每条 exec 都先 source 它 |
+
+- `shell_init` 只在**用户命令**前生效；备份、md5、job 脚本这类内部命令不 source，避免初始化输出污染判断。
+- 初始化片段失败时命令不执行，返回 `exit_code: 97` 且 stderr 有 `[sshmcp] shell_init 失败`，不会和用户命令的退出码混在一起。
+- 顺序是 `cd <cwd>` → `source <shell_init>` → 你的命令；`login_shell` 再整体套 `bash -lc`。
+- 两者都不改变"每条命令独立"的语义：没有隐藏状态，审计可以原样重放。
+
+```json
+"example-conda": {
+  "address": "10.0.0.16",
+  "username": "deploy",
+  "password": "<填口令>",
+  "hostKey": "SHA256:<服务器指纹>",
+  "shell_init": "/opt/miniconda3/etc/profile.d/conda.sh",
+  "purpose": "每条命令前 source conda，省得调用方自己拼 source &&"
+}
+```
 
 ## 文件传输
 

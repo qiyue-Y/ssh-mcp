@@ -165,6 +165,9 @@ class HostCred:
     elevate: bool = False
     elevate_user: str = "root"
     elevate_password: str = ""
+    # 每条命令前 source 的初始化片段（如 conda 激活）。空表示不 source；
+    # 失败时命令不执行并返回 exit 97，不会和用户命令的退出码混在一起。
+    shell_init: str = ""
 
     @property
     def privileged(self) -> bool:
@@ -181,6 +184,7 @@ _KEY_ALIASES = {
     "keyPath": "key_path",
     "elevateUser": "elevate_user",
     "elevatePassword": "elevate_password",
+    "shellInit": "shell_init",
 }
 
 
@@ -398,7 +402,7 @@ def _host_of_output(output_id: str | None) -> str | None:
 # 每次工具调用统一留痕：入口记 call，出口记 result/error，大内容只记引用不复制。
 _AUDIT_ARGS = {
     "list_hosts": ("brief",),
-    "exec": ("host", "command", "cwd", "idle_timeout", "max_duration", "force", "elevate", "detach", "force_reason"),
+    "exec": ("host", "command", "cwd", "idle_timeout", "max_duration", "force", "elevate", "detach", "force_reason", "login_shell"),
     "pin_hostkey": ("host", "trust"),
     "put_file": ("host", "local", "remote", "overwrite", "force", "elevate", "restart", "mode", "force_reason"),
     "get_file": ("host", "remote", "local", "overwrite", "elevate", "restart"),
@@ -887,9 +891,31 @@ def _cd_expr(path: str) -> str:
     return shlex.quote(path)
 
 
-def run_command(cred: HostCred, pin: str, command: str, cwd: str, idle_s: float, max_s: float, spill: OS.Spill, elevate: bool = False) -> RunResult:
-    """在远端执行一条命令。cwd 由服务端记录，发送前才拼上。"""
-    sent = command if cwd in ("", "~") else f"cd {_cd_expr(cwd)} && {command}"
+def _assemble_remote(command: str, cwd: str, cred: HostCred, login_shell: bool = False, shell_init: bool = False) -> str:
+    """拼远端命令串：cd 前缀 → shell_init → 用户命令，需要时整体套 bash -lc。
+
+    没有 shell_init/login_shell 时保持原样（`cd X && cmd` 或裸 command），
+    这样既有调用点与用例的命令串形状不变。
+    """
+    if shell_init and cred.shell_init:
+        cd_prefix = f"cd {_cd_expr(cwd)} && " if cwd not in ("", "~") else ""
+        init = f". {_cd_expr(cred.shell_init)}"
+        # 初始化失败要能一眼看出：固定提示 + exit 97，别混成用户命令的退出码
+        body = f"{cd_prefix}{{ {init}; }} || {{ echo '[sshmcp] shell_init 失败' >&2; exit 97; }}; {command}"
+    else:
+        body = command if cwd in ("", "~") else f"cd {_cd_expr(cwd)} && {command}"
+    if login_shell:
+        body = f"bash -lc {shlex.quote(body)}"
+    return body
+
+
+def run_command(cred: HostCred, pin: str, command: str, cwd: str, idle_s: float, max_s: float, spill: OS.Spill, elevate: bool = False, login_shell: bool = False, shell_init: bool = False) -> RunResult:
+    """在远端执行一条命令。cwd 由服务端记录，发送前才拼上。
+
+    login_shell=true 用 `bash -lc` 跑（读 profile，换来环境变量/PATH 与登录会话一致）；
+    shell_init=true 且凭据里配了 shell_init 时，先 source 那段片段再跑命令。
+    """
+    sent = _assemble_remote(command, cwd, cred, login_shell, shell_init)
     stdin: bytes | None = None
     if elevate:
         stdin = (cred.sudo_password() + "\n").encode("utf-8")
@@ -1041,7 +1067,7 @@ def _backup_remote_targets(alias, cred, pin, targets, cwd, guard, elevate: bool 
     return backup_dir, None
 
 
-def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None, force: bool = False, elevate: bool = False, detach: bool = False, force_reason: str = "") -> dict:
+def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None, force: bool = False, elevate: bool = False, detach: bool = False, force_reason: str = "", login_shell: bool = False) -> dict:
     refusal, cred, pin = _preflight(alias, command)
     if refusal is not None:
         return refusal
@@ -1094,7 +1120,9 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
                           f"敏感文件备份失败，命令未执行：{backup_error}")
 
     if detach:
-        return _start_job(alias, command, cred, pin, guard, start_cwd, rule, idle_s, backup_dir)
+        # detach 的 cwd 由远端 wrapper 处理，这里只把 login_shell / shell_init 拼进命令本身
+        return _start_job(alias, _assemble_remote(command, "~", cred, login_shell, True),
+                          cred, pin, guard, start_cwd, rule, idle_s, backup_dir, original=command)
 
     # 全文落盘和审计同级：写不了就不执行，别把输出留在只有内存知道的地方
     try:
@@ -1106,13 +1134,16 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
         log(f"output/ 轮转清理了 {removed} 个 run")
 
     if cd_target is not None:
-        # cd 的探活探测也按 elevate 走：`cd /root` 用主账号验会假失败，验过了才记 cwd
-        res = run_command(cred, pin, f"cd {_cd_expr(cd_target)} && pwd", start_cwd, idle_s, max_s, spill, elevate)
+        # cd 的探活探测也按 elevate / login_shell 走：`cd /root` 用主账号验会假失败，
+        # 验过了才记 cwd；login_shell 下 profile 可能改目录，所以用同一形态探
+        res = run_command(cred, pin, f"cd {_cd_expr(cd_target)} && pwd", start_cwd, idle_s, max_s, spill, elevate,
+                          login_shell=login_shell)
         end_cwd = res.stdout.strip().splitlines()[-1] if res.exit_code == 0 and res.stdout.strip() else start_cwd
         if res.exit_code == 0:
             POOL.set_cwd(alias, end_cwd)
     else:
-        res = run_command(cred, pin, command, start_cwd, idle_s, max_s, spill, elevate)
+        res = run_command(cred, pin, command, start_cwd, idle_s, max_s, spill, elevate,
+                          login_shell=login_shell, shell_init=True)
         end_cwd = start_cwd
 
     _remember_output_host(res.output_id, alias)
@@ -1252,8 +1283,8 @@ def _tool_list_hosts(brief: bool = False) -> dict:
     }
 
 
-def _tool_exec(host: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None, force: bool = False, elevate: bool = False, detach: bool = False, force_reason: str = "") -> dict:
-    return execute(host, command, cwd, idle_timeout, max_duration, force, elevate, detach, force_reason)
+def _tool_exec(host: str, command: str, cwd: str | None = None, idle_timeout: float | None = None, max_duration: float | None = None, force: bool = False, elevate: bool = False, detach: bool = False, force_reason: str = "", login_shell: bool = False) -> dict:
+    return execute(host, command, cwd, idle_timeout, max_duration, force, elevate, detach, force_reason, login_shell)
 
 
 def _tool_pin_hostkey(host: str, trust: bool = False) -> dict:
@@ -1627,8 +1658,13 @@ def _remote_rm(cred: HostCred, pin: str, path: str, alias: str, guard) -> None:
 # --------------------------------------------------------------------------------------
 
 
-def _start_job(alias: str, command: str, cred: HostCred, pin: str, guard, start_cwd: str, rule: str, idle_s: float, backup: str | None = None) -> dict:
-    """detach=true 的落点：把命令丢到远端后台，立刻带 job_id 回来。"""
+def _start_job(alias: str, command: str, cred: HostCred, pin: str, guard, start_cwd: str, rule: str, idle_s: float, backup: str | None = None, original: str | None = None) -> dict:
+    """detach=true 的落点：把命令丢到远端后台，立刻带 job_id 回来。
+
+    command 是实际下发的命令串（可能已套 bash -lc / shell_init）；
+    original 是用户原话，审计与回显都用它，别把包装壳当成用户命令。
+    """
+    shown = original if original is not None else command
     try:
         spill = _throw_spill(guard)
     except OSError as exc:
@@ -1639,26 +1675,26 @@ def _start_job(alias: str, command: str, cred: HostCred, pin: str, guard, start_
     res = run_command(cred, pin, script, "~", idle_s, 60.0, spill)
     parsed = J.parse_start(res.stdout)
     if parsed["result"] == "busy":
-        out = _block(alias, command, "too_many_jobs", "job_max_concurrent",
+        out = _block(alias, shown, "too_many_jobs", "job_max_concurrent",
                      f"在跑或失联的任务已达上限 {guard.job_max_concurrent}（policy.json defaults.job_max_concurrent）：先 job_list 看清、job_kill 收尾再发")
         out["busy"] = parsed.get("busy")
         return out
     if parsed["result"] != "started":
         try:
-            audit({"host": alias, "command": command, "event": "job_start_failed", "rule": rule,
+            audit({"host": alias, "command": shown, "event": "job_start_failed", "rule": rule,
                    "job_id": job_id, "reason": parsed["result"], "stderr": res.stderr[:300]})
         except OSError:
             pass
-        return {"host": alias, "command": _echo(command), "job_id": job_id, "detached": True, "state": "unknown",
+        return {"host": alias, "command": _echo(shown), "job_id": job_id, "detached": True, "state": "unknown",
                 "error": "job_not_started", "reason": parsed["result"], "exit_code": res.exit_code,
                 "stdout": res.stdout[:300], "stderr": res.stderr[:300],
                 "hint": "远端没写出 pid 文件：看 stdout/stderr（NOPID 多为目录不可写或缺 setsid/nohup）"}
-    started = {"host": alias, "command": command, "event": "job_started", "rule": rule,
+    started = {"host": alias, "command": shown, "event": "job_started", "rule": rule,
                "job_id": job_id, "pid": parsed.get("pid"), "dir": directory or "~"}
     if backup:
         started["backup"] = backup
     audit(started)
-    out = {"host": alias, "command": _echo(command), "job_id": job_id, "detached": True, "state": "running",
+    out = {"host": alias, "command": _echo(shown), "job_id": job_id, "detached": True, "state": "running",
            "pid": parsed.get("pid"), "cwd": start_cwd,
            "next": f"job_status(host='{alias}', job_id='{job_id}') 看状态与输出；job_kill 停它"}
     if backup:
@@ -1848,6 +1884,8 @@ def build_server():
             "channel stdin，口令不进命令行、不进审计、不进远端 history；提权命令一律查清单。"
             "detach=true 把这条命令丢到远端后台跑并立刻返回 job_id（用 job_status 取状态与输出、job_kill 停掉）"
             "——状态存在远端 ~/.sshmcp-jobs/，服务重启/断连/换会话都不丢；v1 与 elevate 互斥。"
+            "login_shell=true 用 bash -lc 跑（读 profile，拿到登录会话的环境变量与 PATH）；"
+            "凭据里配了 shell_init 的机器会先 source 那段片段再跑命令。"
         ),
     )
     @_audited("exec")
@@ -1861,11 +1899,12 @@ def build_server():
         elevate: bool = False,
         detach: bool = False,
         force_reason: str = "",
+        login_shell: bool = False,
     ) -> dict:
         import anyio
 
         return await anyio.to_thread.run_sync(
-            lambda: _tool_exec(host, command, cwd, idle_timeout, max_duration, force, elevate, detach, force_reason)
+            lambda: _tool_exec(host, command, cwd, idle_timeout, max_duration, force, elevate, detach, force_reason, login_shell)
         )
 
     @server.tool(
