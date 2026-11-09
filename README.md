@@ -51,7 +51,7 @@ python test_output_store.py
 python test_audit.py
 ```
 
-前置检查、指纹固定与执行接线的用例要真导入 paramiko，必须用 `uv run`，且**不能写成 `uv run python xxx.py`** —— 那种写法不读文件头的 PEP 723 deps，会拿到本机 site-packages 里缺 `cryptography` 的 paramiko 而报 ModuleNotFoundError：
+前置检查、指纹固定、执行接线与并发用例要真导入 paramiko，必须用 `uv run`，且**不能写成 `uv run python xxx.py`** —— 那种写法不读文件头的 PEP 723 deps，会拿到本机 site-packages 里缺 `cryptography` 的 paramiko 而报 ModuleNotFoundError：
 
 ```powershell
 uv run --quiet test_connect_refusals.py
@@ -159,11 +159,13 @@ sudo -S -p '' --user root -- sh -c '<原命令，含 cd 前缀>'
 - `job_status(host, job_id, offset?, max_bytes?)` —— 读后台任务的状态与输出增量（`offset_next` 供下次只取新增）。
 - `job_kill(host, job_id)` —— 停后台任务：进程组 SIGTERM→5 秒后 SIGKILL，带队里子进程树，杀前核对 `job_is_ours`。
 - `job_list(host, limit?)` —— 列最近的后台任务（running/exited/killed/lost），找孤儿用。
-- `session_reset(host)` —— 丢连接与 cwd 重来。
+- `session_reset(host)` —— 丢连接与 cwd 重来。若有命令在途则返回 `{reset:false, reason:"active_commands", active:N}`，不强杀在途命令。
 - `audit_tail(host?, limit?)` —— 回看最近审计（含被拦的）。所有工具调用都留 `call`/`result` 记录，可用 `call_id` 串联。
 - `read_output(output_id, stream?, mode?, start?, end?, pattern?, limit?)` —— 按 `exec` 返回的 `output_id` 回捞全文。`mode`：`head`/`tail` 按行边界取，`grep` 返回**带行号**的命中（`pattern` 是**子串**匹配，不是正则），`lines` 取 `[start,end]` 行；单次上限 16KB。
 
 **没有** 交互 shell / PTY / 按键透传，这是故意的：netcatty 那套长会话死在 `terminal_execute` 全部挂起上。
+
+**并发**：同一台主机的首次连接只建一条；命令可以并行执行。`cwd` 是 per-host 的共享记忆，并发时最后写入者赢 —— 要确定性就显式传 `cwd=`。同一传输目标会串行（防止两个调用复用同一个 part），不同目标并行。`session_reset` 遇到在途命令会返回 busy，不强杀。
 
 ## 文件传输
 

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import contextvars
 import functools
 import hashlib
@@ -597,21 +598,64 @@ def _load_private_key(cred: HostCred):
 
 
 class Pool:
+    """连接池与 per-host 状态。
+
+    并发模型（2026-11-09）：
+    - 建连/关连接/重置走 per-host 锁，避免并发首连建两条、后写覆盖前一条；
+    - 活跃调用用计数跟踪；run_command 失败时不再 close 共享连接，否则会掐断
+      别的调用正在用的 channel；
+    - cwd 的读写各自加锁；跨命令的「读 cwd → 执行 → 写 cwd」不是原子事务，
+      并发时最后写入者赢，要确定性就由调用方显式传 cwd；
+    - 传输按目标做条带锁，同目标串行、不同目标并行。
+    """
+
     def __init__(self):
         self._clients: dict[str, Any] = {}
         self._cwd: dict[str, str] = {}
         self._locks: dict[str, threading.Lock] = {}
         self._guard = threading.Lock()
+        self._active: dict[str, int] = {}
+        # 固定 64 条条带锁：按路径无限建锁会让服务长跑后内存只增不减
+        self._xfer_locks = [threading.Lock() for _ in range(64)]
 
     def lock(self, alias: str) -> threading.Lock:
         with self._guard:
             return self._locks.setdefault(alias, threading.Lock())
 
     def cwd(self, alias: str) -> str:
-        return self._cwd.get(alias, "~")
+        with self.lock(alias):
+            return self._cwd.get(alias, "~")
 
     def set_cwd(self, alias: str, path: str) -> None:
-        self._cwd[alias] = path
+        with self.lock(alias):
+            self._cwd[alias] = path
+
+    def begin(self, alias: str) -> None:
+        with self._guard:
+            self._active[alias] = self._active.get(alias, 0) + 1
+
+    def end(self, alias: str) -> None:
+        with self._guard:
+            n = self._active.get(alias, 1) - 1
+            if n > 0:
+                self._active[alias] = n
+            else:
+                self._active.pop(alias, None)
+
+    @contextlib.contextmanager
+    def activity(self, alias: str):
+        self.begin(alias)
+        try:
+            yield
+        finally:
+            self.end(alias)
+
+    def active(self, alias: str) -> int:
+        with self._guard:
+            return self._active.get(alias, 0)
+
+    def xfer_lock(self, key: str) -> threading.Lock:
+        return self._xfer_locks[hash(key) % len(self._xfer_locks)]
 
     def _connect(self, cred: HostCred, pin: str):
         import paramiko
@@ -642,33 +686,57 @@ class Pool:
             transport.set_keepalive(30)
         return client
 
-    def client(self, cred: HostCred, pin: str, reconnect: bool = False):
-        existing = self._clients.get(cred.alias)
-        if existing is not None and not reconnect:
-            transport = existing.get_transport()
-            if transport is not None and transport.is_active():
-                return existing
-            self.close(cred.alias)
-        client = self._connect(cred, pin)
-        self._clients[cred.alias] = client
-        return client
+    def client(self, cred: HostCred, pin: str):
+        """取该主机的连接；同一台主机的并发首连只建一条。
 
-    def close(self, alias: str, reset_cwd: bool = False) -> None:
+        建连可能耗时（握手 + 认证），所以只锁同一台主机；不同主机互不阻塞。
+        不再提供 reconnect 参数：失败方不主动关连接，下一次调用按 transport
+        是否存活决定复用还是重连，避免把别人正在用的连接掐掉。
+        """
+        with self.lock(cred.alias):
+            existing = self._clients.get(cred.alias)
+            if existing is not None:
+                transport = existing.get_transport()
+                if transport is not None and transport.is_active():
+                    return existing
+                self._close_locked(cred.alias)
+            client = self._connect(cred, pin)
+            self._clients[cred.alias] = client
+            return client
+
+    def _close_locked(self, alias: str) -> None:
         client = self._clients.pop(alias, None)
         if client is not None:
             try:
                 client.close()
             except Exception as exc:  # noqa: BLE001
                 log(f"关闭 {alias} 连接时报错（忽略）：{exc}")
-        if reset_cwd:
-            self._cwd.pop(alias, None)
+
+    def close(self, alias: str, reset_cwd: bool = False) -> None:
+        with self.lock(alias):
+            self._close_locked(alias)
+            if reset_cwd:
+                self._cwd.pop(alias, None)
+
+    def close_if_idle(self, alias: str, reset_cwd: bool = False) -> int:
+        """有人用时不强杀：返回在途数量；返回 0 表示已经关掉。"""
+        with self.lock(alias):
+            with self._guard:
+                active = self._active.get(alias, 0)
+            if active:
+                return active
+            self._close_locked(alias)
+            if reset_cwd:
+                self._cwd.pop(alias, None)
+            return 0
 
     def connected(self, alias: str) -> bool:
-        client = self._clients.get(alias)
-        if client is None:
-            return False
-        transport = client.get_transport()
-        return bool(transport and transport.is_active())
+        with self.lock(alias):
+            client = self._clients.get(alias)
+            if client is None:
+                return False
+            transport = client.get_transport()
+            return bool(transport and transport.is_active())
 
 
 POOL = Pool()
@@ -809,35 +877,39 @@ def run_command(cred: HostCred, pin: str, command: str, cwd: str, idle_s: float,
         stdin = (cred.sudo_password() + "\n").encode("utf-8")
         sent = _sudo_wrap(sent, cred)
     last_exc: Exception | None = None
-    for attempt in range(2):
-        try:
-            client = POOL.client(cred, pin, reconnect=attempt > 0)
-            transport = client.get_transport()
-            if transport is None or not transport.is_active():
-                raise RuntimeError("transport 不可用")
-            chan = transport.open_session()
-            chan.exec_command(sent)
-            if stdin is not None:
-                # 必须紧跟 exec 之后立刻喂：sudo 的 -S 读不到就整条挂到 idle 超时
-                chan.sendall(stdin)
-                # 关掉 stdin：认证失败时 sudo 会回头再读一次重试，不关就阻塞到 idle 超时
-                # （实测错口令要挂 21s 才报 timed_out=idle，关掉后 sudo 立刻放弃并 exit 1）
-                try:
-                    chan.shutdown_write()
-                except Exception:  # noqa: BLE001 - 通道已被远端关闭时无需再管
-                    pass
-            return _drain(chan, idle_s, time.monotonic() + max_s, spill)
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            # 认证与指纹类错误重试只会喂 fail2ban，直接停
-            if type(exc).__name__ in NO_RETRY:
-                POOL.close(cred.alias)
+    # 失败不关共享连接：别的调用可能正用着同一个 transport。
+    # 连接真死了，下一次 POOL.client() 会按 transport.is_active() 重连。
+    with POOL.activity(cred.alias):
+        for attempt in range(2):
+            try:
+                client = POOL.client(cred, pin)
+                transport = client.get_transport()
+                if transport is None or not transport.is_active():
+                    raise RuntimeError("transport 不可用")
+                chan = transport.open_session()
+                chan.exec_command(sent)
+                if stdin is not None:
+                    # 必须紧跟 exec 之后立刻喂：sudo 的 -S 读不到就整条挂到 idle 超时
+                    chan.sendall(stdin)
+                    # 关掉 stdin：认证失败时 sudo 会回头再读一次重试，不关就阻塞到 idle 超时
+                    # （实测错口令要挂 21s 才报 timed_out=idle，关掉后 sudo 立刻放弃并 exit 1）
+                    try:
+                        chan.shutdown_write()
+                    except Exception:  # noqa: BLE001 - 通道已被远端关闭时无需再管
+                        pass
+                return _drain(chan, idle_s, time.monotonic() + max_s, spill)
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                # 认证与指纹类错误重试只会喂 fail2ban，直接停
+                if type(exc).__name__ in NO_RETRY:
+                    break
+                if attempt == 0:
+                    spill.reset()  # 上一次可能已经写进去半截，不清掉日志会出现重复内容
+                    continue
                 break
-            POOL.close(cred.alias)
-            if attempt == 0:
-                spill.reset()  # 上一次可能已经写进去半截，不清掉日志会出现重复内容
-                continue
-            break
+    # 已经退出活跃计数：只有确实没人用时才回收坏连接。
+    # 若另一条调用还在用这条连接，close_if_idle 会拒绝，留它自己判断。
+    POOL.close_if_idle(cred.alias)
     assert last_exc is not None
     spill.write("err", f"{type(last_exc).__name__}: {last_exc}".encode("utf-8", "replace"))
     spill.close()
@@ -933,6 +1005,8 @@ def execute(alias: str, command: str, cwd: str | None = None, idle_timeout: floa
 
     idle_s = float(idle_timeout or guard.idle_timeout_s)
     max_s = float(max_duration or guard.max_duration_s)
+    # cwd 是 per-host 的服务端记忆；并发调用时最后写入者赢。
+    # 要确定性就显式传 cwd（见 DESIGN.md「并发控制」）。
     start_cwd = cwd or POOL.cwd(alias)
 
     if detach:
@@ -1178,8 +1252,12 @@ def _tool_put_file(host: str, local: str, remote: str, overwrite: bool = False, 
     except OSError as exc:
         return _block(host, f"<put> {remote}", "audit_write_failed", "audit_unwritable", f"审计目录不可写：{exc}")
 
-    deadline = time.monotonic() + guard.xfer_timeout_s
     out: dict = {"host": host, "direction": "put", "local": str(src), "remote": remote, "bytes": size}
+    # 同目标串行：两个调用写同一个远端路径会复用同一个 part，续传点会互相踩。
+    POOL.begin(host)
+    xfer_lock = POOL.xfer_lock(f"put:{host}:{remote}")
+    xfer_lock.acquire()
+    deadline = time.monotonic() + guard.xfer_timeout_s  # 排队等锁的时间不算进传输预算
     sftp = None
     try:
         sftp = _sftp_of(host, cred, pin)
@@ -1240,8 +1318,12 @@ def _tool_put_file(host: str, local: str, remote: str, overwrite: bool = False, 
     except Exception as exc:  # noqa: BLE001 - SFTP/OSError 形态太杂，原样回给调用方
         out.update({"verified": False, "error": f"{type(exc).__name__}: {exc}"})
     finally:
-        if sftp is not None:
-            sftp.close()
+        try:
+            if sftp is not None:
+                sftp.close()
+        finally:
+            xfer_lock.release()
+            POOL.end(host)
     return out
 
 
@@ -1265,7 +1347,11 @@ def _tool_get_file(host: str, remote: str, local: str = "", overwrite: bool = Fa
     except OSError as exc:
         return _block(host, f"<get> {remote}", "audit_write_failed", "audit_unwritable", f"审计目录不可写：{exc}")
 
-    deadline = time.monotonic() + guard.xfer_timeout_s
+    # 同目标串行：两个调用写同一个本机目标会共用同一个 .part 文件。
+    POOL.begin(host)
+    xfer_lock = POOL.xfer_lock(f"get:{host}:{dest}")
+    xfer_lock.acquire()
+    deadline = time.monotonic() + guard.xfer_timeout_s  # 排队等锁的时间不算进传输预算
     sftp = None
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1335,8 +1421,12 @@ def _tool_get_file(host: str, remote: str, local: str = "", overwrite: bool = Fa
     except Exception as exc:  # noqa: BLE001
         out.update({"verified": False, "error": f"{type(exc).__name__}: {exc}"})
     finally:
-        if sftp is not None:
-            sftp.close()
+        try:
+            if sftp is not None:
+                sftp.close()
+        finally:
+            xfer_lock.release()
+            POOL.end(host)
     return out
 
 
@@ -1345,21 +1435,25 @@ def _tool_xfer_stat(host: str, remote: str) -> dict:
     if refusal is not None:
         return refusal
     try:
-        sftp = _sftp_of(host, cred, pin)
+        POOL.begin(host)
         try:
-            st = sftp.stat(remote)
+            sftp = _sftp_of(host, cred, pin)
+            try:
+                st = sftp.stat(remote)
+            finally:
+                sftp.close()
+            return {
+                "host": host,
+                "remote": remote,
+                "exists": True,
+                "size": st.st_size,
+                "mode": oct(st.st_mode or 0),
+                "uid": st.st_uid,
+                "gid": st.st_gid,
+                "mtime": st.st_mtime,
+            }
         finally:
-            sftp.close()
-        return {
-            "host": host,
-            "remote": remote,
-            "exists": True,
-            "size": st.st_size,
-            "mode": oct(st.st_mode or 0),
-            "uid": st.st_uid,
-            "gid": st.st_gid,
-            "mtime": st.st_mtime,
-        }
+            POOL.end(host)
     except IOError as exc:
         hint = "路径不存在，或它只有 root 可读 —— 那种情况用 exec(elevate=true) 的 stat 看"
         return {"host": host, "remote": remote, "exists": False, "error": str(exc), "hint": hint}
@@ -1486,6 +1580,7 @@ def _tool_job_status(host: str, job_id: str, offset: int | None = None, max_byte
     start = max(0, size - limit) if offset is None else max(0, min(int(offset), size))
     raw = b""
     sftp = None
+    POOL.begin(host)
     try:  # out 读不到不该把状态也吞掉：状态照报，内容留空
         sftp = _sftp_of(host, cred, pin)
         with sftp.open(f"{_remote_home(sftp)}/{J.JOBS_DIRNAME}/{job_id}/out", "rb") as fh:
@@ -1495,8 +1590,11 @@ def _tool_job_status(host: str, job_id: str, offset: int | None = None, max_byte
     except Exception:  # noqa: BLE001
         raw = b""
     finally:
-        if sftp is not None:
-            sftp.close()
+        try:
+            if sftp is not None:
+                sftp.close()
+        finally:
+            POOL.end(host)
     out = {
         "host": host, "job_id": job_id, "state": state,
         "exit_code": int(st["code"]) if (st.get("code") or "").isdigit() else None,
@@ -1563,7 +1661,15 @@ def _tool_job_list(host: str, limit: int = 20) -> dict:
 
 
 def _tool_session_reset(host: str) -> dict:
-    POOL.close(host, reset_cwd=True)
+    active = POOL.close_if_idle(host, reset_cwd=True)
+    if active:
+        return {
+            "host": host,
+            "reset": False,
+            "reason": "active_commands",
+            "active": active,
+            "hint": f"还有 {active} 条命令在途；等它们结束后再 reset（不会强杀在途命令）",
+        }
     return {"host": host, "reset": True, "cwd": POOL.cwd(host)}
 
 
@@ -1712,7 +1818,7 @@ def build_server():
 
         return await anyio.to_thread.run_sync(lambda: _tool_xfer_stat(host, remote))
 
-    @server.tool(name="session_reset", description="丢弃某主机的 SSH 连接与 cwd 状态并重新握手。")
+    @server.tool(name="session_reset", description="丢弃某主机的 SSH 连接与 cwd 状态并重新握手。若有命令在途则返回 busy（reset=false），不强杀在途命令。")
     @_audited("session_reset")
     async def _session_reset(host: str) -> dict:
         import anyio

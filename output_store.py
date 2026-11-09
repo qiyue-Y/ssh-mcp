@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import re
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -168,28 +169,53 @@ class Spill:
         }
 
 
-def prune(root: Path, keep_runs: int, keep_bytes: int, keep_days: int) -> int:
-    """按 run 分组删：mtime 新到旧排，条数 / 总量 / 超龄 三个预算任一命中就删掉整组。"""
-    if not root.is_dir():
+_PRUNE_LOCK = threading.Lock()
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
         return 0
-    groups: dict[str, list[Path]] = {}
-    for entry in root.iterdir():
-        if entry.suffix != ".log":
-            continue
-        groups.setdefault(entry.name.split(".")[0], []).append(entry)
-    cutoff = time.time() - keep_days * 86400
-    ordered = sorted(groups.items(), key=lambda kv: max(f.stat().st_mtime for f in kv[1]), reverse=True)
-    removed = kept_bytes = 0
-    for rank, (_, files) in enumerate(ordered):
-        size = sum(f.stat().st_size for f in files)
-        expired = min(f.stat().st_mtime for f in files) < cutoff
-        if rank >= keep_runs or kept_bytes + size > keep_bytes or expired:
-            for handle in files:
-                handle.unlink(missing_ok=True)
-            removed += 1
-        else:
-            kept_bytes += size
-    return removed
+
+
+def prune(root: Path, keep_runs: int, keep_bytes: int, keep_days: int) -> int:
+    """按 run 分组删：mtime 新到旧排，条数 / 总量 / 超龄 三个预算任一命中就删掉整组。
+
+    每次 exec 都会调用它，并发调用必须串行；文件在遍历期间被别的清理删掉时按
+    0 字节/最旧处理，不能让一次正常执行因为清理竞态而失败。
+    """
+    with _PRUNE_LOCK:
+        if not root.is_dir():
+            return 0
+        groups: dict[str, list[Path]] = {}
+        for entry in root.iterdir():
+            if entry.suffix != ".log":
+                continue
+            groups.setdefault(entry.name.split(".")[0], []).append(entry)
+        cutoff = time.time() - keep_days * 86400
+        ordered = sorted(groups.items(), key=lambda kv: max(_mtime(f) for f in kv[1]), reverse=True)
+        removed = kept_bytes = 0
+        for rank, (_, files) in enumerate(ordered):
+            size = sum(_size(f) for f in files)
+            expired = min(_mtime(f) for f in files) < cutoff
+            if rank >= keep_runs or kept_bytes + size > keep_bytes or expired:
+                for handle in files:
+                    try:
+                        handle.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                removed += 1
+            else:
+                kept_bytes += size
+        return removed
 
 
 def read_output(

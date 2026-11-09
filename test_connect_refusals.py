@@ -17,6 +17,8 @@ import json
 import os
 import socket
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -990,6 +992,144 @@ class TransferWiring(unittest.TestCase):
         os.environ.pop("SSHMCP_XFER", None)
         self.assertEqual(M.xfer_dir(g), Path(r"D:\somewhere"))
         self.assertEqual(M.xfer_dir(G.GuardConfig()), M._downloads_dir())
+
+
+class Concurrency(unittest.TestCase):
+    """连接池与共享状态的并发行为。
+
+    这些用例不碰网络：_connect 被换成假的 client/transport，只验证加锁、
+    活跃计数与「失败不关共享连接」这三件事。
+    """
+
+    class _Transport:
+        def __init__(self, active=True, fail_open=False):
+            self.active = active
+            self.fail_open = fail_open
+            self.sessions = 0
+
+        def is_active(self):
+            return self.active
+
+        def open_session(self):
+            self.sessions += 1
+            if self.fail_open:
+                raise RuntimeError("channel failed")
+            return mock.Mock()
+
+    class _Client:
+        def __init__(self, active=True, fail_open=False):
+            self.transport = Concurrency._Transport(active, fail_open)
+            self.closed = False
+
+        def get_transport(self):
+            return self.transport
+
+        def close(self):
+            self.closed = True
+
+    def setUp(self):
+        self.pool = M.Pool()
+        self.patcher = mock.patch.object(M, "POOL", self.pool)
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+        self.cred = M.HostCred(alias="t", address="127.0.0.1", username="u", password="p")
+
+    def test_concurrent_first_connect_creates_one_connection(self):
+        created = []
+
+        def connect(cred, pin):
+            time.sleep(0.05)
+            client = self._Client()
+            created.append(client)
+            return client
+
+        results = []
+        with mock.patch.object(self.pool, "_connect", side_effect=connect):
+            threads = [
+                threading.Thread(target=lambda: results.append(self.pool.client(self.cred, "pin")))
+                for _ in range(10)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(len(created), 1, "并发首连只该握手一次")
+        self.assertEqual(len({id(r) for r in results}), 1, "十次调用应拿到同一个 client")
+
+    def test_dead_transport_is_replaced_under_lock(self):
+        old = self._Client(active=False)
+        self.pool._clients["t"] = old
+        new = self._Client()
+        with mock.patch.object(self.pool, "_connect", return_value=new):
+            got = self.pool.client(self.cred, "pin")
+        self.assertIs(got, new)
+        self.assertTrue(old.closed, "死掉的 transport 应被替换并关闭")
+
+    def test_run_command_failure_does_not_close_shared_client(self):
+        fake = self._Client(fail_open=True)
+        with mock.patch.object(self.pool, "client", return_value=fake):
+            spill = M._throw_spill(M.GUARD.get())
+            res = M.run_command(self.cred, "pin", "id", "~", 0.1, 0.5, spill)
+        self.assertEqual(res.exit_code, -1)
+        self.assertIn("channel failed", res.stderr)
+        self.assertFalse(fake.closed, "失败方不能关掉别的调用可能在用的连接")
+
+    def test_session_reset_is_busy_while_a_command_is_active(self):
+        fake = self._Client()
+        self.pool._clients["t"] = fake
+        self.pool.set_cwd("t", "/tmp")
+        with self.pool.activity("t"):
+            res = M._tool_session_reset("t")
+        self.assertFalse(res["reset"])
+        self.assertEqual(res["reason"], "active_commands")
+        self.assertEqual(res["active"], 1)
+        self.assertFalse(fake.closed, "在途命令期间不能强杀连接")
+        self.assertEqual(self.pool.cwd("t"), "/tmp", "reset 没执行，cwd 也不该动")
+
+        res = M._tool_session_reset("t")
+        self.assertTrue(res["reset"])
+        self.assertTrue(fake.closed)
+        self.assertEqual(res["cwd"], "~")
+
+    def test_xfer_lock_serializes_same_target(self):
+        lock = self.pool.xfer_lock("put:t:/tmp/same")
+        state = {"inside": 0, "max": 0}
+        barrier = threading.Barrier(4)
+
+        def worker():
+            barrier.wait()
+            with lock:
+                state["inside"] += 1
+                state["max"] = max(state["max"], state["inside"])
+                time.sleep(0.02)
+                state["inside"] -= 1
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(state["max"], 1, "同目标传输必须串行")
+
+    def test_concurrent_prune_does_not_raise(self):
+        root = Path(tempfile.mkdtemp(prefix="ssh-mcp-prune-"))
+        for n in range(20):
+            (root / f"run{n:02d}.out.log").write_bytes(b"x" * 100)
+        errors = []
+
+        def worker():
+            try:
+                OS.prune(root, keep_runs=5, keep_bytes=1 << 20, keep_days=999)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [], "并发 prune 不能把正常执行打失败")
+        self.assertLessEqual(len(list(root.glob("*.out.log"))), 5)
 
 
 if __name__ == "__main__":
